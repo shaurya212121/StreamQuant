@@ -1,4 +1,3 @@
-# StreamQuant
 # StreamQuant 📈
 
 **Distributed Financial Intelligence & ML Inference Pipeline**
