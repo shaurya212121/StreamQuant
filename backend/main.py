@@ -3,7 +3,6 @@ from sqlalchemy.orm import Session
 import sys
 from pathlib import Path
 
-# Connect to Chaiti's database files
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
 from db.models import StockPrice
@@ -23,23 +22,18 @@ def health_check():
 
 @app.get("/api/stocks/{ticker}")
 def get_stock_data(ticker: str, limit: int = 30, db: Session = Depends(get_db)):
-    """
-    Fetches the most recent stock data and ML features from the database.
-    """
-    print(f"API Request received for {ticker}")
-    
-    records = (
+        records = (
         db.query(StockPrice)
         .filter(StockPrice.ticker == ticker.upper())
         .order_by(StockPrice.date.desc())
         .limit(limit)
         .all()
     )
-    
-    if not records:
-        raise HTTPException(
+
+        if not records:
+            raise HTTPException(
             status_code=404, 
-            detail=f"No data found in the database for ticker {ticker}."
-        )
-    
-    return {"ticker": ticker.upper(), "data": records}
+        detail=f"No data found in the database for ticker {ticker}."
+            )
+
+        return {"ticker": ticker.upper(), "data": records}
