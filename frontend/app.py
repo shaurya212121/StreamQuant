@@ -78,6 +78,5 @@ if fetch_btn:
         except requests.exceptions.ConnectionError:
             st.error("Backend server error. Is FastAPI running?")
 else:
-    # What the user sees before they click search
     st.title("⚡ Welcome to the StreamQuant Terminal")
     st.markdown("Use the sidebar on the left to search for an asset and run the ML pipeline.")
