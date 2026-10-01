@@ -1,6 +1,6 @@
 from celery import Celery
 import time
-import ssl  # <--- We added the core Python SSL library
+import ssl  
 
 REDIS_URL = "rediss://default:gQAAAAAABH-sAAIgcDJlNDZmNTE2OTgyYjE0OThkODMyODlmNDZjZjk1Njk1MA@summary-fox-294828.upstash.io:6379"
 
@@ -9,8 +9,6 @@ celery_app = Celery(
     broker=REDIS_URL,
     backend=REDIS_URL
 )
-
-# Force Celery to accept the Upstash Cloud certificate
 celery_app.conf.update(
     broker_use_ssl={'ssl_cert_reqs': ssl.CERT_NONE},
     redis_backend_use_ssl={'ssl_cert_reqs': ssl.CERT_NONE}
