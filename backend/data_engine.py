@@ -145,13 +145,16 @@ def store_data_in_db(df: pd.DataFrame, ticker: str):
     finally:
         session.close()
 
-
 if __name__ == "__main__":
-    ticker_symbol = "TSLA"
-    stock_df = fetch_and_prepare_data(ticker_symbol, period="6mo")
+    tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"]
+    
+    for symbol in tickers:
+        print(f"\n--- Fetching & Storing {symbol} ---")
+        df = fetch_and_prepare_data(symbol, period="6mo")
+        
+        print(f"\nProcessed Features Preview for {symbol}:")
+        print(df[["date", "close", "sma_10", "volume", "volume_z_score"]].tail())
+        
+        print(f"\nStoring {symbol} into PostgreSQL...")
+        store_data_in_db(df, ticker=symbol)
 
-    print("\nProcessed Features Preview:")
-    print(stock_df[["date", "close", "sma_10", "volume", "volume_z_score"]].tail())
-
-    print("\nStoring into PostgreSQL...")
-    store_data_in_db(stock_df, ticker=ticker_symbol)
