@@ -24,8 +24,8 @@ def prepare_data(df: pd.DataFrame):
     df['tomorrow_close'] = df['close'].shift(-1)
     df['price_went_up'] = (df['tomorrow_close']>df['close']).astype(int)
 
-    clean_df = df.dropna(subset=['price_went_up','sma_10','sma_50','daily_return'])
-    X = clean_df[['sma_10','sma_50','daily_return']]
+    clean_df = df.dropna(subset=['price_went_up', 'sma_ratio', 'macd', 'rsi', 'daily_return'])
+    X = clean_df[['sma_ratio','macd','rsi','daily_return','volume_z_score']]
     y = clean_df['price_went_up']
 
     return X, y

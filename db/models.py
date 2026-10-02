@@ -24,11 +24,13 @@ class StockPrice(Base):
     close = Column(Float, nullable=False)
     volume = Column(BigInteger, nullable=False)
 
-    sma_10 = Column(Float, nullable=True)
-    sma_50 = Column(Float, nullable=True)
+    sma_ratio = Column(Float, nullable=True)
+    macd = Column(Float, nullable=True)
+    rsi = Column(Float, nullable=True)
     daily_return = Column(Float, nullable=True)
     volume_z_score = Column(Float, nullable=True)
 
     __table_args__ = (
         UniqueConstraint("ticker", "date", name="uq_ticker_daily_bar"),
     )
+    

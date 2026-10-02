@@ -14,7 +14,7 @@ def init_db():
     """Creates tables in PostgreSQL if they do not exist."""
     Base.metadata.create_all(bind=engine)
 
-def fetch_and_prepare_data(ticker: str, period: str = "6mo") -> pd.DataFrame:
+def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     print(f"Fetching data for {ticker}...")
     df = yf.download(
         ticker, period=period, interval="1d", multi_level_index=False
@@ -49,9 +49,23 @@ def fetch_and_prepare_data(ticker: str, period: str = "6mo") -> pd.DataFrame:
     df = prune_metadata_columns(df)
     df = handle_missing_values(df)
 
-    # 2. Trend features
-    df["sma_10"] = df["Close"].rolling(window=10).mean()
-    df["sma_50"] = df["Close"].rolling(window=50).mean()
+   # 2. Trend features (Upgraded to fix downward bias)
+    # Calculate SMA Ratio instead of raw dollars
+    sma_10 = df["Close"].rolling(window=10).mean()
+    sma_50 = df["Close"].rolling(window=50).mean()
+    df["sma_ratio"] = (sma_10 - sma_50) / sma_50
+    
+    # Calculate MACD (Moving Average Convergence Divergence)
+    ema_12 = df["Close"].ewm(span=12, adjust=False).mean()
+    ema_26 = df["Close"].ewm(span=26, adjust=False).mean()
+    df["macd"] = ema_12 - ema_26
+    
+    # Calculate RSI (14-day Relative Strength Index)
+    delta = df["Close"].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / loss
+    df["rsi"] = 100 - (100 / (1 + rs))
     df["daily_return"] = df["Close"].pct_change()
 
     # 3. Anomaly features (rolling volume stats)
@@ -96,7 +110,7 @@ def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = F
     # Define exactly what the database expects
     db_columns = [
         "date", "ticker", "open", "high", "low", "close", "volume",
-        "sma_10", "sma_50", "daily_return", "volume_z_score"
+        "sma_ratio", "macd", "rsi", "daily_return", "volume_z_score"
     ]
 
     # Drop any extra intermediate columns
@@ -160,7 +174,7 @@ def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = F
     finally:
         session.close()
 
-TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"]
+TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN","TSLA"]
 
 
 def run_daily_pipeline(tickers: list[str] | None = None, latest_days: int = 1) -> dict:
@@ -176,7 +190,7 @@ def run_daily_pipeline(tickers: list[str] | None = None, latest_days: int = 1) -
     for symbol in tickers or TICKERS:
         try:
             print(f"\n--- Daily job: {symbol} ---")
-            df = fetch_and_prepare_data(symbol, period="6mo")
+            df = fetch_and_prepare_data(symbol, period="2y")
             if df.empty:
                 results[symbol] = "no data"
                 continue
@@ -198,10 +212,10 @@ if __name__ == "__main__":
     
     for symbol in tickers:
         print(f"\n--- Fetching & Storing {symbol} ---")
-        df = fetch_and_prepare_data(symbol, period="6mo")
+        df = fetch_and_prepare_data(symbol, period="2y")
         
         print(f"\nProcessed Features Preview for {symbol}:")
-        print(df[["date", "close", "sma_10", "volume", "volume_z_score"]].tail())
+        print(df[["date", "close", "sma_ratio", "macd", "rsi", "volume_z_score"]].tail())
         
         print(f"\nStoring {symbol} into PostgreSQL...")
         store_data_in_db(df, ticker=symbol)
