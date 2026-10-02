@@ -69,8 +69,13 @@ def fetch_and_prepare_data(ticker: str, period: str = "6mo") -> pd.DataFrame:
     return df.dropna()
 
 
-def store_data_in_db(df: pd.DataFrame, ticker: str):
-    """Validates and upserts cleaned DataFrame records into PostgreSQL."""
+def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = False):
+    """Validates and upserts cleaned DataFrame records into PostgreSQL.
+
+    update_on_conflict=False keeps the original behaviour (ON CONFLICT DO NOTHING).
+    update_on_conflict=True overwrites an existing (ticker, date) row, which the
+    scheduled job uses so a provisional bar is replaced by the final one.
+    """
     if df.empty:
         print("DataFrame is empty. Skipping database insert.")
         return
@@ -128,8 +133,18 @@ def store_data_in_db(df: pd.DataFrame, ticker: str):
         # Build the insert statement
         stmt = insert(StockPrice).values(data_dicts)
 
-        # Apply the Upsert rule (ON CONFLICT DO NOTHING)
-        stmt = stmt.on_conflict_do_nothing(index_elements=["ticker", "date"])
+        # Apply the Upsert rule
+        if update_on_conflict:
+            update_cols = {
+                c.name: stmt.excluded[c.name]
+                for c in StockPrice.__table__.columns
+                if c.name not in ("id", "ticker", "date")
+            }
+            stmt = stmt.on_conflict_do_update(
+                index_elements=["ticker", "date"], set_=update_cols
+            )
+        else:
+            stmt = stmt.on_conflict_do_nothing(index_elements=["ticker", "date"])
 
         # Execute and commit
         result = session.execute(stmt)
@@ -145,8 +160,41 @@ def store_data_in_db(df: pd.DataFrame, ticker: str):
     finally:
         session.close()
 
+TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"]
+
+
+def run_daily_pipeline(tickers: list[str] | None = None, latest_days: int = 1) -> dict:
+    """Scheduled job: fetch -> sanitize (Pydantic) -> upsert the latest day per ticker.
+
+    A 6-month window is still downloaded because sma_50 / rolling volume stats need
+    history; only the most recent `latest_days` row(s) are written to the database.
+    One failing ticker does not stop the others; failures are reported at the end.
+    """
+    results: dict = {}
+    failures: dict = {}
+
+    for symbol in tickers or TICKERS:
+        try:
+            print(f"\n--- Daily job: {symbol} ---")
+            df = fetch_and_prepare_data(symbol, period="6mo")
+            if df.empty:
+                results[symbol] = "no data"
+                continue
+
+            latest = df.tail(latest_days)
+            store_data_in_db(latest, ticker=symbol, update_on_conflict=True)
+            results[symbol] = f"ok ({str(latest['date'].iloc[-1])[:10]})"
+        except Exception as exc:
+            print(f"Daily job failed for {symbol}: {exc}")
+            failures[symbol] = str(exc)
+
+    if failures:
+        raise RuntimeError(f"Daily pipeline failed for: {failures}. Succeeded: {results}")
+    return results
+
+
 if __name__ == "__main__":
-    tickers = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN"]
+    tickers = TICKERS
     
     for symbol in tickers:
         print(f"\n--- Fetching & Storing {symbol} ---")
@@ -157,4 +205,3 @@ if __name__ == "__main__":
         
         print(f"\nStoring {symbol} into PostgreSQL...")
         store_data_in_db(df, ticker=symbol)
-

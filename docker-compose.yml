@@ -19,5 +19,18 @@ services:
     ports:
       - "6379:6379"
 
+  worker:
+    image: python:3.11-slim
+    container_name: streamquant_worker
+    restart: always
+    working_dir: /app
+    volumes:
+      - .:/app
+    # Single process runs both the Celery worker and the Beat scheduler.
+    # Run exactly one instance of this service, or the daily job will fire twice.
+    command: >
+      sh -c "pip install --no-cache-dir celery redis yfinance pandas 'sqlalchemy>=2.0,<2.1' psycopg2-binary pydantic &&
+             celery -A backend.worker worker --beat --loglevel=info --concurrency=1"
+
 volumes:
   postgres_data:
