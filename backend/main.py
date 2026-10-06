@@ -5,6 +5,8 @@ from pathlib import Path
 from backend.worker import run_heavy_ml_model
 import xgboost as xgb
 import pandas as pd
+from celery.result import AsyncResult
+from backend.worker import celery_app
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
@@ -83,8 +85,9 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
     model.load_model(str(model_path))
 
     features = pd.DataFrame([{
-        "sma_10": latest_record.sma_10,
-        "sma_50": latest_record.sma_50,
+        "sma_ratio": latest_record.sma_ratio,
+        "macd": latest_record.macd,
+        "rsi": latest_record.rsi,
         "daily_return": latest_record.daily_return
     }])
 
@@ -104,4 +107,22 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
         "is_volume_anomaly": is_anomaly,
         "date": str(latest_record.date)
     }
+
+@app.get("/api/tasks/{task_id}")
+def get_task_status(task_id: str):
+    """
+    Check the live status and result of any background Celery ML task.
+    """
+    task_result = AsyncResult(task_id, app=celery_app)
     
+    response = {
+        "task_id": task_id,
+        "status": task_result.status,  # PENDING, STARTED, SUCCESS, FAILURE
+    }
+    
+    if task_result.status == "SUCCESS":
+        response["result"] = task_result.result
+    elif task_result.status == "FAILURE":
+        response["error"] = str(task_result.result)
+        
+    return response

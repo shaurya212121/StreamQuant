@@ -5,7 +5,7 @@ import time
 import ssl  
 from pathlib import Path
 
-REDIS_URL = "rediss://..."  # keep your existing value (better: read it from an env var)
+REDIS_URL = "rediss://default:gQAAAAAABH-sAAIgcDJlNDZmNTE2OTgyYjE0OThkODMyODlmNDZjZjk1Njk1MA@summary-fox-294828.upstash.io:6379"# keep your existing value (better: read it from an env var)
 
 celery_app = Celery(
     "streamquant_worker",
@@ -42,7 +42,6 @@ def run_daily_data_pipeline(self):
     if backend_dir not in sys.path:
         sys.path.insert(0, backend_dir)
     from data_engine import run_daily_pipeline
-
     try:
         return run_daily_pipeline()
     except Exception as exc:
