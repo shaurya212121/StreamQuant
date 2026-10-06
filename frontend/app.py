@@ -63,8 +63,10 @@ if fetch_btn:
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Closing Price", f"${latest['close']:.2f}", f"{price_change:.2f} ({pct_change:.2f}%)")
                 
-                trend = "Bullish" if latest['close'] > latest['sma_10'] else "Bearish"
-                col2.metric("10-Day SMA Trend", f"${latest['sma_10']:.2f}", trend, 
+                # Use Chaiti's new SMA Ratio spread
+                sma_spread = float(latest['sma_ratio']) if 'sma_ratio' in latest and pd.notna(latest['sma_ratio']) else 0.0
+                trend = "Bullish" if sma_spread > 0 else "Bearish"
+                col2.metric("SMA Momentum Ratio", f"{sma_spread:.2%}", trend, 
                             delta_color="normal" if trend == "Bullish" else "inverse")
                 
                 col3.metric("Daily Volume", f"{int(latest['volume']):,}")
@@ -73,16 +75,16 @@ if fetch_btn:
                             "ANOMALY" if is_anomaly else "Normal", 
                             delta_color="inverse" if is_anomaly else "normal")
 
-                # --- MULTI-LINE PRICE & SMA CHART ---
-                st.subheader("Price Action vs. Quantitative Moving Averages")
-                chart_data = df[['close', 'sma_10', 'sma_50']]
-                st.line_chart(chart_data, color=["#FFFFFF", "#00FF00", "#FF0000"])
+                # --- PRICE & MOMENTUM CHARTS ---
+                st.subheader("Price Action History")
+                st.line_chart(df['close'], color="#00FFAA")
                 
                 # --- DEVELOPER TABS ---
                 st.divider()
-                tab1, tab2 = st.tabs(["Engineered ML Features", "Raw Model Inference Payload"])
+                tab1, tab2 = st.tabs(["Engineered ML Features (v2)", "Raw Model Inference Payload"])
                 with tab1:
-                    st.dataframe(df[['open', 'high', 'low', 'close', 'volume', 'sma_10', 'sma_50', 'volume_z_score']], use_container_width=True)
+                    feature_cols = [c for c in ['open', 'high', 'low', 'close', 'volume', 'sma_ratio', 'macd', 'rsi', 'volume_z_score'] if c in df.columns]
+                    st.dataframe(df[feature_cols], use_container_width=True)
                 with tab2:
                     st.json(pred_data)
                     

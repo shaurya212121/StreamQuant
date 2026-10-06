@@ -7,6 +7,8 @@ import xgboost as xgb
 import pandas as pd
 from celery.result import AsyncResult
 from backend.worker import celery_app
+import redis 
+import json
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
@@ -14,6 +16,10 @@ from db.models import StockPrice
 from backend.worker import run_heavy_ml_model
 
 app = FastAPI(title="StreamQuant API", version="1.0")
+
+# Connect to your live Upstash Redis for caching
+REDIS_URL = "rediss://default:gQAAAAAABH-sAAIgcDJlNDZmNTE2OTgyYjE0OThkODMyODlmNDZjZjk1Njk1MA@summary-fox-294828.upstash.io:6379"
+redis_client = redis.Redis.from_url(REDIS_URL, ssl_cert_reqs=None)
 
 def get_db():
     db = SessionLocal()
@@ -59,10 +65,19 @@ def start_ml_task(ticker: str):
 
 @app.get("/api/stocks/{ticker}/prediction")
 def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
-    """
-    Synchronous Endpoint: Instantly loads Chaiti's XGBoost model and returns the forecast.
-    """
     ticker = ticker.upper()
+    cache_key = f"prediction:{ticker}"
+
+    # 1. Check Redis Cache first (Cache HIT)
+    try:
+        cached_data = redis_client.get(cache_key)
+        if cached_data:
+            print(f"[CACHE HIT] ⚡ Returning cached prediction for {ticker} directly from Redis!")
+            return json.loads(cached_data)
+    except Exception as e:
+        print(f"[CACHE WARNING] Redis lookup failed: {e}")
+
+    # 2. If not in cache (Cache MISS), run database query & XGBoost model
     model_path = Path(__file__).resolve().parent.parent / "ml_models" / f"{ticker}_xgb_model.json"
     
     if not model_path.exists():
@@ -70,6 +85,7 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
             status_code=404, 
             detail=f"No trained model found for {ticker}. Available models: AAPL, AMZN, GOOGL, MSFT, NVDA, TSLA"
         )
+    
     latest_record = (
         db.query(StockPrice)
         .filter(StockPrice.ticker == ticker)
@@ -81,6 +97,7 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
             status_code=404, 
             detail=f"No stock data found in database for {ticker}."
         )
+        
     model = xgb.XGBClassifier()
     model.load_model(str(model_path))
 
@@ -88,7 +105,8 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
         "sma_ratio": latest_record.sma_ratio,
         "macd": latest_record.macd,
         "rsi": latest_record.rsi,
-        "daily_return": latest_record.daily_return
+        "daily_return": latest_record.daily_return,
+        "volume_z_score": latest_record.volume_z_score
     }])
 
     pred = int(model.predict(features)[0])
@@ -97,16 +115,28 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
 
     is_anomaly = bool(latest_record.volume_z_score and latest_record.volume_z_score > 3.0)
     
-    # 7. Return the forecast
-    return {
+    result = {
         "ticker": ticker,
         "latest_close": latest_record.close,
         "trend_prediction": "BULLISH" if pred == 1 else "BEARISH",
         "confidence_pct": round(confidence, 2),
         "volume_z_score": latest_record.volume_z_score,
         "is_volume_anomaly": is_anomaly,
-        "date": str(latest_record.date)
+        "date": str(latest_record.date),
+        "cached": False
     }
+
+    # 3. Store result in Redis with a 5-minute (300 seconds) expiration TTL
+    try:
+        cached_payload = result.copy()
+        cached_payload["cached"] = True
+        redis_client.setex(cache_key, 300, json.dumps(cached_payload))
+        print(f"[CACHE SAVED] 💾 Saved {ticker} prediction in Redis for 300 seconds.")
+    except Exception as e:
+        print(f"[CACHE WARNING] Redis save failed: {e}")
+
+    return result
+
 
 @app.get("/api/tasks/{task_id}")
 def get_task_status(task_id: str):
