@@ -1,0 +1,9 @@
+{
+    "ticker": "AAPL",
+    "total_trading_days": 451,
+    "strategy_return_pct": 1497.34,
+    "buyhold_return_pct": 34.98,
+    "win_rate_pct": 98.7,
+    "max_drawdown_pct": -3.46,
+    "sharpe_ratio": 8.0612
+}

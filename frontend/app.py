@@ -14,7 +14,6 @@ with st.sidebar:
     st.divider()
     ticker = st.text_input("🔍 Search Ticker:", "TSLA").upper()
     fetch_btn = st.button("Run Intelligence Pipeline", use_container_width=True)
-
 # --- MAIN DASHBOARD ---
 if fetch_btn:
     with st.spinner(f"Running Distributed Pipeline for {ticker}..."):

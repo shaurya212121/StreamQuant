@@ -1,0 +1,9 @@
+{
+    "ticker": "AMZN",
+    "total_trading_days": 451,
+    "strategy_return_pct": 2200.75,
+    "buyhold_return_pct": 7.8,
+    "win_rate_pct": 94.32,
+    "max_drawdown_pct": -2.32,
+    "sharpe_ratio": 7.6154
+}

@@ -1,0 +1,9 @@
+{
+    "ticker": "GOOGL",
+    "total_trading_days": 451,
+    "strategy_return_pct": 2311.25,
+    "buyhold_return_pct": 74.12,
+    "win_rate_pct": 90.34,
+    "max_drawdown_pct": -3.59,
+    "sharpe_ratio": 8.2343
+}

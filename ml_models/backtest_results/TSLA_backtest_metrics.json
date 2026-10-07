@@ -1,0 +1,9 @@
+{
+    "ticker": "TSLA",
+    "total_trading_days": 451,
+    "strategy_return_pct": 18184.7,
+    "buyhold_return_pct": -16.63,
+    "win_rate_pct": 95.09,
+    "max_drawdown_pct": -6.64,
+    "sharpe_ratio": 8.1834
+}

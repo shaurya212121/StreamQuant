@@ -1,0 +1,9 @@
+{
+    "ticker": "MSFT",
+    "total_trading_days": 451,
+    "strategy_return_pct": 1200.13,
+    "buyhold_return_pct": 15.78,
+    "win_rate_pct": 95.11,
+    "max_drawdown_pct": -3.93,
+    "sharpe_ratio": 6.8331
+}

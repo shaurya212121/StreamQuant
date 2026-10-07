@@ -1,0 +1,9 @@
+{
+    "ticker": "NVDA",
+    "total_trading_days": 451,
+    "strategy_return_pct": 7641.93,
+    "buyhold_return_pct": 66.15,
+    "win_rate_pct": 93.47,
+    "max_drawdown_pct": -11.03,
+    "sharpe_ratio": 8.3817
+}

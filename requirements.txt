@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+sqlalchemy>=2.0,<2.1
+xgboost
+pandas
+celery
+redis
+psycopg2-binary
+pydantic
+streamlit
+requests
+yfinance
+shap
+scikit-learn
+numpy
+python-dotenv
