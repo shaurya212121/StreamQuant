@@ -21,13 +21,12 @@ def generate_trade_explanation(model, current_features,feature_names,prediction_
             "shap_value": shap_val
         })
     contributions.sort(key=lambda x: abs(x["shap_value"]), reverse=True)
-    top_drivers = contributions[:2]
+    top_drivers = contributions[:3]
     direction = "BULLISH" if prediction_is_bullish else "BEARISH"
-    reasons = [f"{driver['feature']} was {driver['value']}" for driver in top_drivers]
-    explanation = f"{direction} because {' and '.join(reasons)}."
-
-    logger.info(f"Generated explanation: {explanation}")
-    return explanation
+    return{
+        "direction": direction,
+        "top_drivers": top_drivers
+    }
 
 def export_model_metrics(y_true,y_pred,ticker,filepath="models_metrics.json"):
     metrics = {

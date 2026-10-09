@@ -36,6 +36,10 @@ class StockPrice(Base):
     daily_return = Column(Float, nullable=True)
     volume_z_score = Column(Float, nullable=True)
 
+    rolling_sharpe = Column(Float)
+    rolling_max_drawdown = Column(Float)
+    atr_20 = Column(Float)
+    
     __table_args__ = (
         UniqueConstraint("ticker", "date", name="uq_ticker_daily_bar"),
     )

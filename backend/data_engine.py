@@ -14,6 +14,27 @@ def init_db():
     """Creates tables in PostgreSQL if they do not exist."""
     Base.metadata.create_all(bind=engine)
 
+    
+def add_advanced_features(df):
+    daily_returns = df['Close'].pct_change()
+    rolling_mean = daily_returns.rolling(window=20).mean()
+    rolling_std = daily_returns.rolling(window=20).std()
+    
+    # Explicitly cast to float to prevent object dtype errors
+    df['rolling_sharpe'] = ((rolling_mean / (rolling_std + 1e-6)) * (252 ** 0.5)).astype(float)
+
+    rolling_max = df['Close'].rolling(window=20).max()
+    df['rolling_max_drawdown'] = ((df['Close'] - rolling_max) / rolling_max).astype(float)
+
+    high_low = df['High'] - df['Low']
+    high_close = abs(df['High'] - df['Close'].shift())
+    low_close = abs(df['Low'] - df['Close'].shift())
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    df['atr_20'] = tr.rolling(window=20).mean().astype(float)
+
+    return df
+
+
 def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     print(f"Fetching data for {ticker}...")
     df = yf.download(
@@ -49,8 +70,7 @@ def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     df = prune_metadata_columns(df)
     df = handle_missing_values(df)
 
-   # 2. Trend features (Upgraded to fix downward bias)
-    # Calculate SMA Ratio instead of raw dollars
+    # 2. Trend features (Upgraded to fix downward bias)
     sma_10 = df["Close"].rolling(window=10).mean()
     sma_50 = df["Close"].rolling(window=50).mean()
     df["sma_ratio"] = (sma_10 - sma_50) / sma_50
@@ -73,23 +93,21 @@ def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     vol_std = df["Volume"].rolling(window=20).std()
     df["volume_z_score"] = (df["Volume"] - vol_mean) / vol_std
 
-    # 4. Normalize timestamps: remove timezone info safely if it's a DatetimeIndex / datetime column
+    # 4. Inject advanced quantitative risk & volatility features
+    df = add_advanced_features(df)
+
+    # 5. Normalize timestamps: remove timezone info safely if it's a DatetimeIndex / datetime column
     if pd.api.types.is_datetime64tz_dtype(df["date"]):
         df["date"] = df["date"].dt.tz_localize(None)
 
-    # 5. Lowercase all column headers to match PostgreSQL table schema
+    # 6. Lowercase all column headers to match PostgreSQL table schema
     df.columns = [c.lower() for c in df.columns]
 
     return df.dropna()
 
 
 def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = False):
-    """Validates and upserts cleaned DataFrame records into PostgreSQL.
-
-    update_on_conflict=False keeps the original behaviour (ON CONFLICT DO NOTHING).
-    update_on_conflict=True overwrites an existing (ticker, date) row, which the
-    scheduled job uses so a provisional bar is replaced by the final one.
-    """
+    """Validates and upserts cleaned DataFrame records into PostgreSQL."""
     if df.empty:
         print("DataFrame is empty. Skipping database insert.")
         return
@@ -107,10 +125,11 @@ def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = F
     # Explicitly add the ticker column
     records_df["ticker"] = ticker
 
-    # Define exactly what the database expects
+    # Define exactly what the database expects (including our 3 new risk features)
     db_columns = [
         "date", "ticker", "open", "high", "low", "close", "volume",
-        "sma_ratio", "macd", "rsi", "daily_return", "volume_z_score"
+        "sma_ratio", "macd", "rsi", "daily_return", "volume_z_score",
+        "rolling_sharpe", "rolling_max_drawdown", "atr_20"
     ]
 
     # Drop any extra intermediate columns
@@ -174,16 +193,10 @@ def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = F
     finally:
         session.close()
 
-TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN","TSLA"]
+TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA"]
 
 
 def run_daily_pipeline(tickers: list[str] | None = None, latest_days: int = 1) -> dict:
-    """Scheduled job: fetch -> sanitize (Pydantic) -> upsert the latest day per ticker.
-
-    A 6-month window is still downloaded because sma_50 / rolling volume stats need
-    history; only the most recent `latest_days` row(s) are written to the database.
-    One failing ticker does not stop the others; failures are reported at the end.
-    """
     results: dict = {}
     failures: dict = {}
 
@@ -215,7 +228,7 @@ if __name__ == "__main__":
         df = fetch_and_prepare_data(symbol, period="2y")
         
         print(f"\nProcessed Features Preview for {symbol}:")
-        print(df[["date", "close", "sma_ratio", "macd", "rsi", "volume_z_score"]].tail())
+        print(df[["date", "close", "sma_ratio", "macd", "rsi", "volume_z_score", "rolling_sharpe"]].tail())
         
         print(f"\nStoring {symbol} into PostgreSQL...")
         store_data_in_db(df, ticker=symbol)
