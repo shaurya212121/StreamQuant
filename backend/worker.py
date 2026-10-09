@@ -3,9 +3,15 @@ from celery.schedules import crontab
 import sys
 import time
 import ssl  
+import os
 from pathlib import Path
+from dotenv import load_dotenv
 
-REDIS_URL = "rediss://default:gQAAAAAABH-sAAIgcDJlNDZmNTE2OTgyYjE0OThkODMyODlmNDZjZjk1Njk1MA@summary-fox-294828.upstash.io:6379"# keep your existing value (better: read it from an env var)
+# Explicitly load root .env file
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
 celery_app = Celery(
     "streamquant_worker",

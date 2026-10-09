@@ -15,11 +15,18 @@ from db.database import SessionLocal
 from db.models import StockPrice
 from backend.worker import run_heavy_ml_model
 
+import os
+from dotenv import load_dotenv
+
+# Explicitly load root .env file
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=ENV_PATH)
+
 app = FastAPI(title="StreamQuant API", version="1.0")
 
-# Connect to your live Upstash Redis for caching
-REDIS_URL = "rediss://default:gQAAAAAABH-sAAIgcDJlNDZmNTE2OTgyYjE0OThkODMyODlmNDZjZjk1Njk1MA@summary-fox-294828.upstash.io:6379"
-redis_client = redis.Redis.from_url(REDIS_URL, ssl_cert_reqs=None)
+# Connect to Redis using environment variable
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_client = redis.from_url(REDIS_URL)
 
 def get_db():
     db = SessionLocal()
