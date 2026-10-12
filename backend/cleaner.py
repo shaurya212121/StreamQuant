@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 
 import pandas as pd
+import numpy as np
 
 logger = logging.getLogger("streamquant.cleaner")
 
@@ -45,14 +46,16 @@ def calculate_sma(series: pd.Series, window: int = 20) -> pd.Series:
     return series.rolling(window=window, min_periods=window).mean()
 
 
-def calculate_volume_zscore(volume: pd.Series) -> pd.Series:
-    mean = volume.mean()
-    std = volume.std()
+def calculate_volume_zscore(volume: pd.Series, window: int = 20) -> pd.Series:
+    """
+    Calculate volume Z-score using backward-looking 20-day rolling statistics.
+    Prevents Lookahead Bias by never aggregating future rows.
+    """
+    rolling_mean = volume.rolling(window=window, min_periods=window).mean()
+    rolling_std = volume.rolling(window=window, min_periods=window).std()
 
-    if std == 0 or pd.isna(std):
-        return pd.Series(0.0, index=volume.index)
-
-    return (volume - mean) / std
+    zscore = (volume - rolling_mean) / rolling_std.replace(0, np.nan)
+    return zscore.fillna(0.0)
 
 
 def clean_and_enrich(df: pd.DataFrame, sma_window: int = 20) -> pd.DataFrame:

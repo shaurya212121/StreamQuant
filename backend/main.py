@@ -27,6 +27,19 @@ app = FastAPI(title="StreamQuant API", version="1.0")
 # Connect to Redis using environment variable
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_client = redis.from_url(REDIS_URL)
+# In-memory cache to load model files once into RAM instead of reading from disk on every HTTP request
+LOADED_MODELS = {}
+
+def get_loaded_model(ticker: str):
+    ticker = ticker.upper()
+    if ticker not in LOADED_MODELS:
+        model_path = Path(__file__).resolve().parent.parent / "ml_models" / f"{ticker}_xgb_model.json"
+        if not model_path.exists():
+            return None
+        m = xgb.XGBClassifier()
+        m.load_model(str(model_path))
+        LOADED_MODELS[ticker] = m
+    return LOADED_MODELS[ticker]
 
 def get_db():
     db = SessionLocal()
@@ -79,7 +92,7 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
     try:
         cached_data = redis_client.get(cache_key)
         if cached_data:
-            print(f"[CACHE HIT] ⚡ Returning cached prediction for {ticker} directly from Redis!")
+            print(f"[CACHE HIT] Returning cached prediction for {ticker} directly from Redis!")
             return json.loads(cached_data)
     except Exception as e:
         print(f"[CACHE WARNING] Redis lookup failed: {e}")
@@ -105,15 +118,23 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
             detail=f"No stock data found in database for {ticker}."
         )
         
-    model = xgb.XGBClassifier()
-    model.load_model(str(model_path))
+    model = get_loaded_model(ticker)
+    if not model:
+        raise HTTPException(
+            status_code=404, 
+            detail=f"No trained model found for {ticker}."
+        )
 
+    # Supply all 8 features expected by Chaiti's retrained XGBoost model
     features = pd.DataFrame([{
-        "sma_ratio": latest_record.sma_ratio,
-        "macd": latest_record.macd,
-        "rsi": latest_record.rsi,
-        "daily_return": latest_record.daily_return,
-        "volume_z_score": latest_record.volume_z_score
+        "sma_ratio": latest_record.sma_ratio or 0.0,
+        "macd": latest_record.macd or 0.0,
+        "rsi": latest_record.rsi or 50.0,
+        "daily_return": latest_record.daily_return or 0.0,
+        "volume_z_score": latest_record.volume_z_score or 0.0,
+        "rolling_sharpe": getattr(latest_record, "rolling_sharpe", 0.0) or 0.0,
+        "rolling_max_drawdown": getattr(latest_record, "rolling_max_drawdown", 0.0) or 0.0,
+        "atr_20": getattr(latest_record, "atr_20", 0.0) or 0.0
     }])
 
     pred = int(model.predict(features)[0])
@@ -138,7 +159,7 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
         cached_payload = result.copy()
         cached_payload["cached"] = True
         redis_client.setex(cache_key, 300, json.dumps(cached_payload))
-        print(f"[CACHE SAVED] 💾 Saved {ticker} prediction in Redis for 300 seconds.")
+        print(f"[CACHE SAVED] Saved {ticker} prediction in Redis for 300 seconds.")
     except Exception as e:
         print(f"[CACHE WARNING] Redis save failed: {e}")
 
