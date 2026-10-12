@@ -42,32 +42,24 @@ Deploying complex models synchronously behind a monolithic REST API causes sever
 ## 🏗️ Architecture & Data Flow
 
 ```mermaid
-flowchart TD
-    subgraph Ingestion_Layer["1. Data Ingestion & Quality Gateway"]
-        YF["Yahoo Finance API / Market Feeds"] --> DE["data_engine.py (Feature Extraction)"]
-        DE --> QC["Pydantic Schema Gate (StockRecordSchema)"]
-        QC -->|"Idempotent Upsert"| DB["Supabase Cloud PostgreSQL"]
-    end
+graph TD
+    A[Market Data / Yahoo Finance] --> B[Data Engine & Feature Engineering]
+    B --> C[Pydantic Validation Firewall]
+    C --> D[(Supabase PostgreSQL)]
 
-    subgraph Caching_Gateway["2. API Gateway & Caching Tier"]
-        Client["Client / Streamlit Terminal"] <-->|"HTTP / REST"| API["FastAPI Gateway (backend/main.py)"]
-        API <-->|"Cache Check / Set (5-min TTL)"| Redis["Upstash Cloud Redis (In-Memory RAM)"]
-        API <-->|"Fast Indexed Reads"| DB
-    end
+    E[Streamlit UI / Clients] <-->|HTTP / REST| F[FastAPI Gateway]
+    F <-->|Cache Check / Set: 5m TTL| G[(Upstash Redis Cache)]
+    F <-->|Indexed Reads| D
 
-    subgraph Async_Worker_Pool["3. Distributed Task Queue & Scheduling"]
-        API -->|"Dispatch .delay()"| Queue["Redis Task Queue (Broker)"]
-        Beat["Celery Beat Scheduler (4:00 PM EST Cron)"] --> Queue
-        Queue --> Worker["Celery Worker Pool (backend/worker.py)"]
-        Worker --> DB
-    end
+    F -->|Dispatch Tasks| H[Redis Task Broker]
+    I[Celery Beat Scheduler: 16:15 EST] --> H
+    H --> J[Celery Async Workers]
+    J --> D
 
-    subgraph Intelligence_Layer["4. Multi-Modal Quantitative & AI Models"]
-        Worker & API --> M1["Model 1: XGBoost v2 Trend Classifier"]
-        Worker & API --> M2["Model 2: Volume Z-Score Anomaly Engine"]
-        Worker & API --> M3["Model 3: FinBERT Transformer NLP"]
-        Worker & API --> M4["Model 4: SHAP Explainability Engine"]
-    end
+    J & F --> K[XGBoost Directional Model v2]
+    J & F --> L[Volume Z-Score Anomaly Engine]
+    J & F --> M[FinBERT NLP Sentiment Engine]
+    J & F --> N[SHAP Explainability Engine]
 ```
 
 ---
