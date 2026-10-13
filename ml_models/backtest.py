@@ -59,10 +59,6 @@ RISK_FREE_RATE: float = 0.0   # assume 0 for simplicity; adjust if needed
 # ═══════════════════════════════════════════════════════════════════════
 
 def load_backtest_data(ticker: str, lookback_years: int = LOOKBACK_YEARS) -> pd.DataFrame:
-    """
-    Pull *at least* ``lookback_years`` of history from the database for
-    the given ticker and return it sorted by date ascending.
-    """
     cutoff_date = datetime.now().date() - timedelta(days=lookback_years * 365)
 
     query = (
@@ -71,15 +67,10 @@ def load_backtest_data(ticker: str, lookback_years: int = LOOKBACK_YEARS) -> pd.
         .where(StockPrice.date >= cutoff_date)
         .order_by(StockPrice.date)
     )
-
     df = pd.read_sql(query, con=engine)
-
     if df.empty:
         logger.warning("No data found for %s going back %d years.", ticker, lookback_years)
-
     return df
-
-
 # ═══════════════════════════════════════════════════════════════════════
 # 2.  CORE BACKTEST ENGINE
 # ═══════════════════════════════════════════════════════════════════════
