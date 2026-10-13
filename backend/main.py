@@ -2,18 +2,18 @@ from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 import sys
 from pathlib import Path
-from backend.worker import run_heavy_ml_model
 import xgboost as xgb
 import pandas as pd
 from celery.result import AsyncResult
-from backend.worker import celery_app
 import redis 
 import json
 
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
-from db.models import StockPrice
-from backend.worker import run_heavy_ml_model
+# Added StockNewsSentiment model import
+from db.models import StockPrice, StockNewsSentiment 
+# Added run_batch_sentiment import
+from backend.worker import celery_app, run_heavy_ml_model, run_batch_sentiment
 
 import os
 from dotenv import load_dotenv
@@ -27,6 +27,7 @@ app = FastAPI(title="StreamQuant API", version="1.0")
 # Connect to Redis using environment variable
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_client = redis.from_url(REDIS_URL)
+
 # In-memory cache to load model files once into RAM instead of reading from disk on every HTTP request
 LOADED_MODELS = {}
 
@@ -54,7 +55,7 @@ def health_check():
 
 @app.get("/api/stocks/{ticker}")
 def get_stock_data(ticker: str, limit: int = 30, db: Session = Depends(get_db)):
-        records = (
+    records = (
         db.query(StockPrice)
         .filter(StockPrice.ticker == ticker.upper())
         .order_by(StockPrice.date.desc())
@@ -62,13 +63,58 @@ def get_stock_data(ticker: str, limit: int = 30, db: Session = Depends(get_db)):
         .all()
     )
 
-        if not records:
-            raise HTTPException(
+    if not records:
+        raise HTTPException(
             status_code=404, 
-        detail=f"No data found in the database for ticker {ticker}."
-            )
+            detail=f"No data found in the database for ticker {ticker}."
+        )
 
-        return {"ticker": ticker.upper(), "data": records}
+    return {"ticker": ticker.upper(), "data": records}
+
+# FLAW #11 FIX: Non-blocking DB lookup for FinBERT Sentiment
+@app.get("/api/sentiment/{ticker}")
+def get_stock_sentiment(ticker: str, db: Session = Depends(get_db)):
+    """
+    Fast, non-blocking DB lookup. Returns pre-computed FinBERT sentiment in ~2ms.
+    Replaces the previous architecture where ML inference blocked the web request.
+    """
+    ticker = ticker.upper()
+    
+    # Query the pre-calculated result written by the background Celery worker
+    record = (
+        db.query(StockNewsSentiment)
+        .filter(StockNewsSentiment.ticker == ticker)
+        .order_by(StockNewsSentiment.sentiment_date.desc())
+        .first()
+    )
+    
+    if not record:
+        # Trigger background calculation if missing, but do not block the thread
+        run_batch_sentiment.delay(ticker)
+        raise HTTPException(
+            status_code=404, 
+            detail=f"Sentiment data not yet computed for {ticker}. Background job triggered."
+        )
+        
+    return {
+        "ticker": ticker,
+        "sentiment_score": record.sentiment_score,
+        "positive_prob": record.positive_prob,
+        "negative_prob": record.negative_prob,
+        "neutral_prob": record.neutral_prob,
+        "headline_count": record.headline_count,
+        "sentiment_date": str(record.sentiment_date),
+        "cached_db_result": True
+    }
+
+@app.post("/api/sentiment/{ticker}/refresh")
+def refresh_stock_sentiment(ticker: str):
+    """Manually push a symbol to the Celery queue for an out-of-cycle ML sentiment update."""
+    task = run_batch_sentiment.delay(ticker.upper())
+    return {
+        "message": f"Background sentiment analysis triggered for {ticker.upper()}.",
+        "task_id": task.id
+    }
 
 @app.post("/api/ml-task/{ticker}")
 def start_ml_task(ticker: str):
@@ -88,7 +134,6 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
     ticker = ticker.upper()
     cache_key = f"prediction:{ticker}"
 
-    # 1. Check Redis Cache first (Cache HIT)
     try:
         cached_data = redis_client.get(cache_key)
         if cached_data:
@@ -97,7 +142,6 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
     except Exception as e:
         print(f"[CACHE WARNING] Redis lookup failed: {e}")
 
-    # 2. If not in cache (Cache MISS), run database query & XGBoost model
     model_path = Path(__file__).resolve().parent.parent / "ml_models" / f"{ticker}_xgb_model.json"
     
     if not model_path.exists():
@@ -125,7 +169,6 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
             detail=f"No trained model found for {ticker}."
         )
 
-    # Supply all 8 features expected by Chaiti's retrained XGBoost model
     features = pd.DataFrame([{
         "sma_ratio": latest_record.sma_ratio or 0.0,
         "macd": latest_record.macd or 0.0,
@@ -154,7 +197,6 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
         "cached": False
     }
 
-    # 3. Store result in Redis with a 5-minute (300 seconds) expiration TTL
     try:
         cached_payload = result.copy()
         cached_payload["cached"] = True
@@ -165,7 +207,6 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
 
     return result
 
-
 @app.get("/api/tasks/{task_id}")
 def get_task_status(task_id: str):
     """
@@ -175,7 +216,7 @@ def get_task_status(task_id: str):
     
     response = {
         "task_id": task_id,
-        "status": task_result.status,  # PENDING, STARTED, SUCCESS, FAILURE
+        "status": task_result.status,
     }
     
     if task_result.status == "SUCCESS":

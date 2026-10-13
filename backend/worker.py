@@ -18,6 +18,7 @@ celery_app = Celery(
     broker=REDIS_URL,
     backend=REDIS_URL
 )
+
 celery_app.conf.update(
     broker_use_ssl={'ssl_cert_reqs': ssl.CERT_NONE},
     redis_backend_use_ssl={'ssl_cert_reqs': ssl.CERT_NONE},
@@ -27,8 +28,14 @@ celery_app.conf.update(
     beat_schedule={
         "daily-market-close-ingestion": {
             "task": "backend.worker.run_daily_data_pipeline",
-            "schedule": crontab(hour=16, minute=0, day_of_week="mon-fri"),
+            # FLAW #9 FIX: Shifted minute=0 to minute=15 to bypass the 4:00 PM closing auction data race
+            "schedule": crontab(hour=16, minute=15, day_of_week="mon-fri"),
         },
+        "daily-sentiment-batch-processing": {
+            "task": "backend.worker.run_all_symbols_sentiment",
+            # Run nightly to pre-compute FinBERT sentiment for the next day
+            "schedule": crontab(hour=2, minute=0),
+        }
     },
 )
 
@@ -52,3 +59,31 @@ def run_daily_data_pipeline(self):
         return run_daily_pipeline()
     except Exception as exc:
         raise self.retry(exc=exc)
+
+# FLAW #11 FIX: Decoupled FinBERT execution background task
+@celery_app.task(bind=True, max_retries=3, default_retry_delay=60)
+def run_batch_sentiment(self, ticker: str):
+    """
+    Executes the heavy FinBERT sentiment model entirely in the background,
+    saving the result to PostgreSQL to avoid blocking the FastAPI event loop.
+    """
+    ml_dir = str(Path(__file__).resolve().parent.parent / "ml_models")
+    if ml_dir not in sys.path:
+        sys.path.insert(0, ml_dir)
+    from ml_models.sentiment import analyze_and_store
+    
+    print(f"\n[WORKER] 🚀 Starting Background Sentiment Analysis for {ticker}...")
+    try:
+        # Executes ML inference and directly writes to DB
+        result = analyze_and_store(ticker)
+        print(f"[WORKER] ✅ Finished Sentiment Analysis for {ticker}!")
+        return {"ticker": ticker, "status": "SENTIMENT_COMPLETE"}
+    except Exception as exc:
+        print(f"[WORKER] ❌ Failed Sentiment Analysis for {ticker}: {exc}")
+        raise self.retry(exc=exc)
+
+@celery_app.task
+def run_all_symbols_sentiment():
+    active_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
+    for sym in active_symbols:
+        run_batch_sentiment.delay(sym)

@@ -25,6 +25,9 @@ BATCH_SIZE = 16
 MAX_TOKENS = 128 
 HTTP_TIMEOUT = 10
 
+# FLAW #11 FIX CONTEXT: This lazy, thread-safe model loading mechanism will now be 
+# isolated entirely within the Celery worker process RAM, guaranteeing that it 
+# never initializes inside the FastAPI web server or starves request threads.
 _model_lock = threading.Lock()
 _model_bundle = None  
 
@@ -195,7 +198,10 @@ def score_headlines(symbol: str, headlines: List[str]) -> SentimentResult:
 def analyze_and_store(
     symbol: str, run_date: Optional[date_type] = None
 ) -> Optional[SentimentResult]:
-
+    """
+    Entry point for Celery Worker to fetch news, run heavy inference, 
+    and store the computed result safely into the database.
+    """
     symbol = symbol.upper().strip()
     run_date = run_date or date_type.today()
 
