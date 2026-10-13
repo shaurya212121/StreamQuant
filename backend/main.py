@@ -7,7 +7,8 @@ import pandas as pd
 from celery.result import AsyncResult
 import redis 
 import json
-
+from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Depends, HTTPException, Request
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
 # Added StockNewsSentiment model import
@@ -24,6 +25,39 @@ load_dotenv(dotenv_path=ENV_PATH)
 
 app = FastAPI(title="StreamQuant API", version="1.0")
 
+# --- DISTRIBUTED RATE LIMITER (Redis Sliding Window) ---
+RATE_LIMIT_MAX_REQUESTS = 30  # Max requests allowed
+RATE_LIMIT_WINDOW_SECONDS = 60  # Time window (1 minute)
+
+@app.middleware("http")
+async def rate_limit_middleware(request: Request, call_next):
+    # Only rate-limit API endpoints, skip docs and health checks
+    if request.url.path.startswith("/api/"):
+        client_ip = request.client.host if request.client else "unknown"
+        rate_key = f"rate_limit:{client_ip}"
+
+        try:
+            # Atomic increment in Redis
+            requests_count = redis_client.incr(rate_key)
+            if requests_count == 1:
+                # Set 60-second expiration on the first request
+                redis_client.expire(rate_key, RATE_LIMIT_WINDOW_SECONDS)
+
+            if requests_count > RATE_LIMIT_MAX_REQUESTS:
+                ttl = redis_client.ttl(rate_key)
+                return JSONResponse(
+                    status_code=429,
+                    content={
+                        "error": "Too Many Requests",
+                        "message": f"Rate limit exceeded (30 req/min). Try again in {ttl} seconds."
+                    }
+                )
+        except Exception as e:
+            # Fail-open: If Redis is down, don't block legitimate user traffic
+            pass
+
+    response = await call_next(request)
+    return response
 # Connect to Redis using environment variable
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_client = redis.from_url(REDIS_URL)
