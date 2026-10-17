@@ -1,8 +1,9 @@
 import streamlit as st
 import requests
 import pandas as pd
+import plotly.graph_objects as go
 
-API_URL = "http://127.0.0.1:8000/api/stocks"
+API_BASE = "http://127.0.0.1:8000/api"
 
 # 1. Page Configuration
 st.set_page_config(page_title="StreamQuant Terminal", page_icon="⚡", layout="wide")
@@ -19,37 +20,58 @@ with st.sidebar:
 if fetch_btn:
     with st.spinner(f"Running Distributed Pipeline for {ticker}..."):
         try:
-            # 1. Fetch Historical Price Data from FastAPI
-            hist_response = requests.get(f"{API_URL}/{ticker}?limit=50")
+            # 1. Fetch Unified Intelligence from Gateway
+            intel_response = requests.get(f"{API_BASE}/stocks/{ticker}/intelligence")
+            # 2. Fetch Historical Price Data
+            hist_response = requests.get(f"{API_BASE}/stocks/{ticker}?limit=50")
             
-            # 2. Fetch Live XGBoost Prediction & Anomaly Signal from FastAPI
-            pred_response = requests.get(f"{API_URL}/{ticker}/prediction")
-            
-            if hist_response.status_code == 200 and pred_response.status_code == 200:
+            if hist_response.status_code == 200:
                 hist_data = hist_response.json()["data"]
-                pred_data = pred_response.json()
-                
                 df = pd.DataFrame(hist_data)
                 df['date'] = pd.to_datetime(df['date'])
                 df = df.sort_values('date').set_index('date')
                 
+                # Parse Intelligence or fallback to legacy prediction
+                if intel_response.status_code == 200:
+                    intel_data = intel_response.json()
+                    ml_layer = intel_data["ml_trend_layer"]
+                    confluence = intel_data["confluence_decision"]
+                    anomaly_layer = intel_data["statistical_anomaly_layer"]
+                    sentiment_layer = intel_data["nlp_sentiment_layer"]
+                    
+                    signal = ml_layer["prediction"]
+                    confidence = ml_layer["confidence_pct"]
+                    top_drivers = ml_layer.get("top_drivers", [])
+                    is_anomaly = anomaly_layer["is_anomaly"]
+                    z_score = anomaly_layer["volume_z_score"]
+                    confluence_signal = confluence["signal"]
+                    confluence_summary = confluence["summary"]
+                else:
+                    # Fallback to direct prediction endpoint
+                    pred_res = requests.get(f"{API_BASE}/stocks/{ticker}/prediction")
+                    pred_data = pred_res.json() if pred_res.status_code == 200 else {}
+                    signal = pred_data.get("trend_prediction", "NEUTRAL")
+                    confidence = pred_data.get("confidence_pct", 50.0)
+                    is_anomaly = pred_data.get("is_volume_anomaly", False)
+                    z_score = pred_data.get("volume_z_score", 0.0)
+                    confluence_signal = signal
+                    confluence_summary = "Signal generated directly from XGBoost trend model."
+                    top_drivers = []
+                    intel_data = pred_data
+                    sentiment_layer = {"status": "UNAVAILABLE", "sentiment_score": 0.0}
+
                 st.header(f"📊 {ticker} Intelligence Report")
                 
-                # ==========================================
-                # NEW: AI SIGNAL & ANOMALY BANNER
-                # ==========================================
-                signal = pred_data["trend_prediction"]
-                confidence = pred_data["confidence_pct"]
-                is_anomaly = pred_data["is_volume_anomaly"]
-                z_score = pred_data["volume_z_score"]
-                
-                if signal == "BULLISH":
-                    st.success(f"🤖 **AI SIGNAL: BULLISH (UPWARD BIAS)** | Model Confidence: **{confidence}%**")
+                # --- CONFLUENCE BANNER ---
+                if "BUY" in confluence_signal:
+                    st.success(f"🎯 **UNIFIED SIGNAL: {confluence_signal}** | Model Confidence: **{confidence}%**\n\n_{confluence_summary}_")
+                elif "SELL" in confluence_signal:
+                    st.error(f"⚠️ **UNIFIED SIGNAL: {confluence_signal}** | Model Confidence: **{confidence}%**\n\n_{confluence_summary}_")
                 else:
-                    st.error(f"🤖 **AI SIGNAL: BEARISH (DOWNWARD BIAS)** | Model Confidence: **{confidence}%**")
+                    st.info(f"⚖️ **UNIFIED SIGNAL: {confluence_signal}** | Model Confidence: **{confidence}%**\n\n_{confluence_summary}_")
                     
                 if is_anomaly:
-                    st.warning(f"🚨 **STATISTICAL ANOMALY DETECTED:** Volume Z-Score is **{z_score:.2f}σ** (Institutional Volume Spike!)")
+                    st.warning(f"🚨 **STATISTICAL ANOMALY DETECTED:** Volume Z-Score is **{z_score:.2f}σ** (Institutional Whale Activity!)")
                 
                 st.divider()
                 
@@ -63,7 +85,6 @@ if fetch_btn:
                 col1, col2, col3, col4 = st.columns(4)
                 col1.metric("Closing Price", f"${latest['close']:.2f}", f"{price_change:.2f} ({pct_change:.2f}%)")
                 
-                # Use Chaiti's new SMA Ratio spread
                 sma_spread = float(latest['sma_ratio']) if 'sma_ratio' in latest and pd.notna(latest['sma_ratio']) else 0.0
                 trend = "Bullish" if sma_spread > 0 else "Bearish"
                 col2.metric("SMA Momentum Ratio", f"{sma_spread:.2%}", trend, 
@@ -75,18 +96,49 @@ if fetch_btn:
                             "ANOMALY" if is_anomaly else "Normal", 
                             delta_color="inverse" if is_anomaly else "normal")
 
-                # --- PRICE & MOMENTUM CHARTS ---
+                # --- PRICE & MOMENTUM CHART (PLOTLY) ---
                 st.subheader("Price Action History")
-                st.line_chart(df['close'], color="#00FFAA")
+                try:
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(
+                        x=df.index, 
+                        y=df['close'], 
+                        mode='lines',
+                        name='Close Price',
+                        line=dict(color='#00FFAA', width=2.5)
+                    ))
+                    fig.update_layout(
+                        template="plotly_dark",
+                        paper_bgcolor="#0E1117",
+                        plot_bgcolor="#0E1117",
+                        margin=dict(l=20, r=20, t=30, b=20),
+                        height=400,
+                        xaxis=dict(showgrid=True, gridcolor="#262730"),
+                        yaxis=dict(showgrid=True, gridcolor="#262730", tickprefix="$")
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                except Exception:
+                    st.line_chart(df['close'])
                 
-                # --- DEVELOPER TABS ---
+                # --- DEVELOPER & AI EXPLAINABILITY TABS ---
                 st.divider()
-                tab1, tab2 = st.tabs(["Engineered ML Features (v2)", "Raw Model Inference Payload"])
+                tab1, tab2, tab3 = st.tabs(["Engineered ML Features (v2)", "SHAP Explainability Drivers", "Raw Gateway Payload"])
                 with tab1:
-                    feature_cols = [c for c in ['open', 'high', 'low', 'close', 'volume', 'sma_ratio', 'macd', 'rsi', 'volume_z_score'] if c in df.columns]
+                    feature_cols = [c for c in ['open', 'high', 'low', 'close', 'volume', 'sma_ratio', 'macd', 'rsi', 'volume_z_score', 'rolling_sharpe', 'rolling_max_drawdown', 'atr_20'] if c in df.columns]
                     st.dataframe(df[feature_cols], use_container_width=True)
                 with tab2:
-                    st.json(pred_data)
+                    if top_drivers:
+                        st.markdown("#### Top Features Driving Today's AI Decision")
+                        for d in top_drivers:
+                            feat_name = d.get('feature', 'N/A')
+                            val = d.get('current_value', 0.0)
+                            impact = d.get('shap_impact', 0.0)
+                            arrow = "🟢 Bullish Driver" if impact > 0 else "🔴 Bearish Drag"
+                            st.write(f"- **{feat_name.upper()}** (Value: `{val}`): Contribution = `{impact:+.4f}` ({arrow})")
+                    else:
+                        st.info("SHAP drivers will appear once models are evaluated with explainability.")
+                with tab3:
+                    st.json(intel_data)
                     
             elif hist_response.status_code == 404:
                 st.warning(f"No data found in the database for {ticker}.")
