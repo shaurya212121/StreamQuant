@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends, HTTPException
 from sqlalchemy.orm import Session
 import sys
+import threading
 from pathlib import Path
 import xgboost as xgb
 import pandas as pd
@@ -30,17 +31,21 @@ redis_client = redis.from_url(REDIS_URL)
 
 # In-memory cache to load model files once into RAM instead of reading from disk on every HTTP request
 LOADED_MODELS = {}
+_model_cache_lock = threading.Lock()
 
 def get_loaded_model(ticker: str):
     ticker = ticker.upper()
-    if ticker not in LOADED_MODELS:
-        model_path = Path(__file__).resolve().parent.parent / "ml_models" / f"{ticker}_xgb_model.json"
-        if not model_path.exists():
-            return None
-        m = xgb.XGBClassifier()
-        m.load_model(str(model_path))
-        LOADED_MODELS[ticker] = m
-    return LOADED_MODELS[ticker]
+    if ticker in LOADED_MODELS:
+        return LOADED_MODELS[ticker]
+    with _model_cache_lock:
+        if ticker not in LOADED_MODELS:
+            model_path = Path(__file__).resolve().parent.parent / "ml_models" / f"{ticker}_xgb_model.json"
+            if not model_path.exists():
+                return None
+            m = xgb.XGBClassifier()
+            m.load_model(str(model_path))
+            LOADED_MODELS[ticker] = m
+    return LOADED_MODELS.get(ticker)
 
 def get_db():
     db = SessionLocal()
@@ -84,7 +89,7 @@ def get_stock_sentiment(ticker: str, db: Session = Depends(get_db)):
     record = (
         db.query(StockNewsSentiment)
         .filter(StockNewsSentiment.ticker == ticker)
-        .order_by(StockNewsSentiment.sentiment_date.desc())
+        .order_by(StockNewsSentiment.date.desc())
         .first()
     )
     

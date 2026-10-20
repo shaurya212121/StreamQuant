@@ -44,7 +44,7 @@ def export_model_metrics(y_true,y_pred,ticker,filepath="models_metrics.json"):
         exisiting_data={}
 
     exisiting_data.update(metrics)
-    with open(filepath,'r') as f:
+    with open(filepath,'w') as f:
         json.dump(exisiting_data,f,indent=4)
     logger.info(f"Exported health metrics for {ticker} to {filepath}")
 

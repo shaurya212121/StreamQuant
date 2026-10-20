@@ -1,4 +1,5 @@
 import pandas as pd
+import numpy as np
 import yfinance as yf
 import sys
 from pathlib import Path
@@ -27,8 +28,8 @@ def add_advanced_features(df):
     df['rolling_max_drawdown'] = ((df['Close'] - rolling_max) / rolling_max).astype(float)
 
     high_low = df['High'] - df['Low']
-    high_close = abs(df['High'] - df['Close'].shift())
-    low_close = abs(df['Low'] - df['Close'].shift())
+    high_close = (df['High'] - df['Close'].shift()).abs()
+    low_close = (df['Low'] - df['Close'].shift()).abs()
     tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
     df['atr_20'] = tr.rolling(window=20).mean().astype(float)
 
@@ -84,7 +85,7 @@ def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     delta = df["Close"].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss
+    rs = gain / loss.replace(0, np.nan)
     df["rsi"] = 100 - (100 / (1 + rs))
     df["daily_return"] = df["Close"].pct_change()
 
@@ -96,9 +97,9 @@ def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     # 4. Inject advanced quantitative risk & volatility features
     df = add_advanced_features(df)
 
-    # 5. Normalize timestamps: remove timezone info safely if it's a DatetimeIndex / datetime column
+    # 5. Normalize timestamps: convert to UTC then strip timezone for naive storage
     if pd.api.types.is_datetime64tz_dtype(df["date"]):
-        df["date"] = df["date"].dt.tz_localize(None)
+        df["date"] = df["date"].dt.tz_convert("UTC").dt.tz_localize(None)
 
     # 6. Lowercase all column headers to match PostgreSQL table schema
     df.columns = [c.lower() for c in df.columns]
@@ -216,8 +217,11 @@ def run_daily_pipeline(tickers: list[str] | None = None, latest_days: int = 1) -
             failures[symbol] = str(exc)
 
     if failures:
-        raise RuntimeError(f"Daily pipeline failed for: {failures}. Succeeded: {results}")
-    return results
+        import logging
+        logging.getLogger("streamquant.data_engine").error(
+            "Daily pipeline partial failure: %s. Succeeded: %s", failures, results
+        )
+    return {"succeeded": results, "failed": failures}
 
 
 if __name__ == "__main__":

@@ -97,8 +97,6 @@ def fetch_headlines(symbol: str, limit: int = MAX_HEADLINES) -> List[str]:
 def _load_finbert():
     """Lazy, thread-safe singleton so the model loads once per process."""
     global _model_bundle
-    if _model_bundle is not None:
-        return _model_bundle
     with _model_lock:
         if _model_bundle is None:
             import torch

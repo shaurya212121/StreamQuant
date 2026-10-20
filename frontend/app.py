@@ -25,7 +25,13 @@ if fetch_btn:
             # 2. Fetch Live XGBoost Prediction & Anomaly Signal from FastAPI
             pred_response = requests.get(f"{API_URL}/{ticker}/prediction")
             
-            if hist_response.status_code == 200 and pred_response.status_code == 200:
+            if hist_response.status_code != 200:
+                error_detail = hist_response.json().get("detail", "Unknown error") if hist_response.headers.get("content-type", "").startswith("application/json") else hist_response.text
+                st.warning(f"No historical data found for {ticker}: {error_detail}")
+            elif pred_response.status_code != 200:
+                error_detail = pred_response.json().get("detail", "Unknown error") if pred_response.headers.get("content-type", "").startswith("application/json") else pred_response.text
+                st.error(f"Prediction unavailable for {ticker}: {error_detail}")
+            else:
                 hist_data = hist_response.json()["data"]
                 pred_data = pred_response.json()
                 
@@ -87,11 +93,6 @@ if fetch_btn:
                     st.dataframe(df[feature_cols], use_container_width=True)
                 with tab2:
                     st.json(pred_data)
-                    
-            elif hist_response.status_code == 404:
-                st.warning(f"No data found in the database for {ticker}.")
-            else:
-                st.error("Error communicating with backend services.")
         except requests.exceptions.ConnectionError:
             st.error("Could not connect to FastAPI. Make sure your backend server is running on port 8000!")
 else:
