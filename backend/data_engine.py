@@ -1,21 +1,82 @@
+import datetime
+import logging
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from db.database import SessionLocal, engine
 from db.models import StockPrice, Base
 from cleaner import prune_metadata_columns, handle_missing_values
 from stock import StockRecordSchema
 
+logger = logging.getLogger("streamquant.data_engine")
+
+FEATURE_COLUMNS = [
+    "sma_ratio", "macd", "rsi", "daily_return", "volume_z_score",
+    "rolling_sharpe", "rolling_max_drawdown", "atr_20",
+]
+
+# Rolling means of exact zeros can come back as ~1e-17 instead of 0.0 because
+# pandas uses running sums; treat anything this small as zero.
+_ZERO_TOLERANCE = 1e-10
+
 
 def init_db():
     """Creates tables in PostgreSQL if they do not exist."""
     Base.metadata.create_all(bind=engine)
 
-    
+
+def calculate_rsi(close: pd.Series, window: int = 14) -> pd.Series:
+    """14-day RSI using simple rolling means of gains and losses.
+
+    Edge cases a naive gain/loss ratio gets wrong:
+    - no losses in the window (pure rally) -> 100, not NaN
+    - no gains and no losses (flat price)   -> 50
+    The first `window` rows have no full window and stay NaN (warm-up).
+    """
+    delta = close.diff()
+    gain = delta.clip(lower=0).rolling(window=window).mean()
+    loss = (-delta.clip(upper=0)).rolling(window=window).mean()
+
+    gain = gain.mask(gain.abs() < _ZERO_TOLERANCE, 0.0)
+    loss = loss.mask(loss.abs() < _ZERO_TOLERANCE, 0.0)
+
+    rs = gain / loss.replace(0, np.nan)
+    rsi = 100 - (100 / (1 + rs))
+    rsi = rsi.mask((loss == 0) & (gain > 0), 100.0)
+    rsi = rsi.mask((loss == 0) & (gain == 0), 50.0)
+    return rsi.clip(lower=0.0, upper=100.0)
+
+
+def drop_warmup_rows(df: pd.DataFrame, feature_cols: list[str] = FEATURE_COLUMNS) -> pd.DataFrame:
+    """Drop only the leading rows where rolling features are still warming up.
+
+    Everything from the first fully-populated row onwards is kept, including
+    the newest bar. A NaN that appears after the warm-up is logged and kept
+    (stored as NULL) instead of silently deleting the row.
+    """
+    complete = df[feature_cols].notna().all(axis=1)
+    if not complete.any():
+        return df.iloc[0:0]
+
+    first_complete = complete.to_numpy().argmax()
+    trimmed = df.iloc[first_complete:]
+
+    late_gaps = trimmed[feature_cols].isna().any(axis=1)
+    if late_gaps.any():
+        logger.warning(
+            "Keeping %d post-warm-up row(s) with missing features (stored as NULL): %s",
+            int(late_gaps.sum()),
+            [str(d)[:10] for d in trimmed.loc[late_gaps, "date"]],
+        )
+    return trimmed
+
+
 def add_advanced_features(df):
     daily_returns = df['Close'].pct_change()
     rolling_mean = daily_returns.rolling(window=20).mean()
@@ -82,11 +143,7 @@ def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     df["macd"] = ema_12 - ema_26
     
     # Calculate RSI (14-day Relative Strength Index)
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
+    df["rsi"] = calculate_rsi(df["Close"], window=14)
     df["daily_return"] = df["Close"].pct_change()
 
     # 3. Anomaly features (rolling volume stats)
@@ -104,7 +161,9 @@ def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     # 6. Lowercase all column headers to match PostgreSQL table schema
     df.columns = [c.lower() for c in df.columns]
 
-    return df.dropna()
+    # 7. Drop only the warm-up rows at the start; never the newest bar
+    df = df.replace([np.inf, -np.inf], np.nan)
+    return drop_warmup_rows(df).reset_index(drop=True)
 
 
 def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = False):
@@ -136,6 +195,10 @@ def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = F
     # Drop any extra intermediate columns
     final_cols = [c for c in db_columns if c in records_df.columns]
     records_df = records_df[final_cols]
+
+    # NaN/inf would be stored as Postgres 'NaN' and later break JSON responses; store NULL instead
+    records_df = records_df.replace([np.inf, -np.inf], np.nan)
+    records_df = records_df.astype(object).where(records_df.notna(), None)
 
     print("DEBUG - Rows ready for insert:", len(records_df))
     print(records_df.head(2))
@@ -196,8 +259,45 @@ def store_data_in_db(df: pd.DataFrame, ticker: str, update_on_conflict: bool = F
 
 TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA"]
 
+# Recent bars re-upserted on every run so late revisions from Yahoo are picked up
+OVERLAP_BARS = 5
 
-def run_daily_pipeline(tickers: list[str] | None = None, latest_days: int = 1) -> dict:
+
+def get_last_stored_date(ticker: str) -> datetime.date | None:
+    """Most recent bar date stored for `ticker`, or None if it has no rows yet."""
+    session = SessionLocal()
+    try:
+        return session.execute(
+            select(func.max(StockPrice.date)).where(StockPrice.ticker == ticker)
+        ).scalar()
+    finally:
+        session.close()
+
+
+def select_rows_to_store(
+    df: pd.DataFrame, last_stored: datetime.date | None, overlap_bars: int = OVERLAP_BARS
+) -> pd.DataFrame:
+    """Every bar after `last_stored`, plus the `overlap_bars` bars before it.
+
+    With no stored history, the whole frame is returned (initial load). Market
+    holidays need no special handling: Yahoo only returns trading days, so a
+    holiday simply produces no new rows.
+    """
+    if last_stored is None:
+        return df
+
+    is_new = df["date"] > pd.Timestamp(last_stored)
+    first_new = int(is_new.to_numpy().argmax()) if is_new.any() else len(df)
+    return df.iloc[max(0, first_new - overlap_bars):]
+
+
+def run_daily_pipeline(tickers: list[str] | None = None, overlap_bars: int = OVERLAP_BARS) -> dict:
+    """Store every bar missing from PostgreSQL since the last stored date, for each ticker.
+
+    A worker outage of N days is backfilled on the next run instead of leaving
+    permanent gaps. Features are computed on the full 2y history so rolling
+    windows are correct, but only the missing (and overlap) bars are written.
+    """
     results: dict = {}
     failures: dict = {}
 
@@ -209,16 +309,32 @@ def run_daily_pipeline(tickers: list[str] | None = None, latest_days: int = 1) -
                 results[symbol] = "no data"
                 continue
 
-            latest = df.tail(latest_days)
-            store_data_in_db(latest, ticker=symbol, update_on_conflict=True)
-            results[symbol] = f"ok ({str(latest['date'].iloc[-1])[:10]})"
+            last_stored = get_last_stored_date(symbol)
+            if last_stored is not None and df["date"].iloc[0] > pd.Timestamp(last_stored):
+                logger.warning(
+                    "%s: last stored bar is %s but fetched history starts %s; "
+                    "bars in between cannot be backfilled from this fetch window.",
+                    symbol, last_stored, str(df["date"].iloc[0])[:10],
+                )
+
+            to_store = select_rows_to_store(df, last_stored, overlap_bars)
+            new_bars = to_store if last_stored is None else to_store[to_store["date"] > pd.Timestamp(last_stored)]
+
+            store_data_in_db(to_store, ticker=symbol, update_on_conflict=True)
+
+            if new_bars.empty:
+                results[symbol] = f"up to date ({last_stored})"
+            else:
+                results[symbol] = (
+                    f"ok: {len(new_bars)} new bar(s) "
+                    f"{str(new_bars['date'].iloc[0])[:10]} to {str(new_bars['date'].iloc[-1])[:10]}"
+                )
         except Exception as exc:
             print(f"Daily job failed for {symbol}: {exc}")
             failures[symbol] = str(exc)
 
     if failures:
-        import logging
-        logging.getLogger("streamquant.data_engine").error(
+        logger.error(
             "Daily pipeline partial failure: %s. Succeeded: %s", failures, results
         )
     return {"succeeded": results, "failed": failures}
