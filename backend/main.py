@@ -1,5 +1,6 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
+from sqlalchemy import text
 import sys
 import threading
 from pathlib import Path
@@ -9,13 +10,10 @@ from celery.result import AsyncResult
 import redis 
 import json
 from fastapi.responses import JSONResponse
-from fastapi import FastAPI, Depends, HTTPException, Request
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
-# Added StockNewsSentiment model import
 from db.models import StockPrice, StockNewsSentiment 
-# Added run_batch_sentiment import
-from backend.worker import celery_app, run_heavy_ml_model, run_batch_sentiment
+from backend.worker import celery_app, run_batch_sentiment
 from pydantic import BaseModel, Field
 from backend.execution import alpaca_executor
 import os
@@ -62,7 +60,7 @@ async def rate_limit_middleware(request: Request, call_next):
     return response
 # Connect to Redis using environment variable
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
-redis_client = redis.from_url(REDIS_URL)
+redis_client = redis.from_url(REDIS_URL, socket_timeout=0.5, socket_connect_timeout=0.5)
 
 # In-memory cache to load model files once into RAM instead of reading from disk on every HTTP request
 LOADED_MODELS = {}
@@ -91,10 +89,26 @@ def get_db():
 
 @app.get("/")
 def health_check():
-    return {"status": "Online", "message": "StreamQuant API is ready to serve data!"}
+    checks = {"postgres": "unknown", "redis": "unknown"}
+    overall_status = "Online"
+    try:
+        redis_client.ping()
+        checks["redis"] = "connected"
+    except Exception:
+        checks["redis"] = "disconnected"
+        overall_status = "Degraded"
+    try:
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+        db.close()
+        checks["postgres"] = "connected"
+    except Exception:
+        checks["postgres"] = "disconnected"
+        overall_status = "Degraded"
+    return {"status": overall_status, "message": "StreamQuant API is operational!", "checks": checks}
 
 @app.get("/api/stocks/{ticker}")
-def get_stock_data(ticker: str, limit: int = 30, db: Session = Depends(get_db)):
+def get_stock_data(ticker: str, limit: int = Query(30, ge=1, le=500), db: Session = Depends(get_db)):
     records = (
         db.query(StockPrice)
         .filter(StockPrice.ticker == ticker.upper())
@@ -130,7 +144,10 @@ def get_stock_sentiment(ticker: str, db: Session = Depends(get_db)):
     
     if not record:
         # Trigger background calculation if missing, but do not block the thread
-        run_batch_sentiment.delay(ticker)
+        try:
+            run_batch_sentiment.delay(ticker)
+        except Exception as e:
+            print(f"[SENTIMENT BROKER WARNING] Celery broker unreachable: {e}")
         raise HTTPException(
             status_code=404, 
             detail=f"Sentiment data not yet computed for {ticker}. Background job triggered."
@@ -143,7 +160,7 @@ def get_stock_sentiment(ticker: str, db: Session = Depends(get_db)):
         "negative_prob": record.negative_prob,
         "neutral_prob": record.neutral_prob,
         "headline_count": record.headline_count,
-        "sentiment_date": str(record.sentiment_date),
+        "sentiment_date": str(record.date),
         "cached_db_result": True
     }
 
@@ -156,18 +173,7 @@ def refresh_stock_sentiment(ticker: str):
         "task_id": task.id
     }
 
-@app.post("/api/ml-task/{ticker}")
-def start_ml_task(ticker: str):
-    """
-    This pushes the heavy ML task to Redis and immediately replies to the user.
-    """
-    # .delay() is the magic Celery word that means "Send this to Redis!"
-    task = run_heavy_ml_model.delay(ticker.upper())
-    
-    return {
-        "message": f"ML Task for {ticker.upper()} has been sent to the background!",
-        "task_id": task.id
-    }
+
 
 @app.get("/api/stocks/{ticker}/prediction")
 def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
@@ -262,7 +268,7 @@ def get_task_status(task_id: str):
     if task_result.status == "SUCCESS":
         response["result"] = task_result.result
     elif task_result.status == "FAILURE":
-        response["error"] = str(task_result.result)
+        response["error"] = "Task execution failed" 
         
     return response
 
@@ -385,8 +391,11 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
             "status": "AVAILABLE"
         }
     else:
-        # Trigger background Celery calculation if missing
-        run_batch_sentiment.delay(ticker)
+        # Trigger background Celery calculation if missing (fail-safe)
+        try:
+            run_batch_sentiment.delay(ticker)
+        except Exception as e:
+            print(f"[SENTIMENT BROKER WARNING] Celery broker unreachable: {e}")
         sentiment_data = {
             "sentiment_score": 0.0,
             "positive_prob": 0.33,
