@@ -16,7 +16,8 @@ from db.database import SessionLocal
 from db.models import StockPrice, StockNewsSentiment 
 # Added run_batch_sentiment import
 from backend.worker import celery_app, run_heavy_ml_model, run_batch_sentiment
-
+from pydantic import BaseModel, Field
+from backend.execution import alpaca_executor
 import os
 from dotenv import load_dotenv
 
@@ -449,3 +450,35 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
         print(f"[CACHE WARNING] Failed to cache in Redis: {e}")
 
     return response_payload
+
+class TradeRequest(BaseModel):
+    symbol: str = Field(..., example="AAPL")
+    qty: float = Field(..., gt=0, example=1.0)
+    signal: str = Field(..., example="STRONG BUY")
+
+@app.get("/portfolio-summary")
+def get_portfolio_summary():
+    """
+    Exposes paper account metrics (cash balance, total equity, buying power) 
+    to the Streamlit frontend portfolio dashboard.
+    """
+    return alpaca_executor.get_account_portfolio()
+
+@app.get("/recent-orders")
+def get_recent_orders():
+    """
+    Exposes recent filled and active order logs for compliance audit trails.
+    """
+    return alpaca_executor.get_recent_orders()
+
+@app.post("/execute-trade")
+def execute_trade(request: TradeRequest):
+    """
+    Receives trade triggers from the UI, validates them through Pydantic,
+    and routes them through the execution engine's risk firewall.
+    """
+    return alpaca_executor.execute_trade_signal(
+        symbol=request.symbol,
+        qty=request.qty,
+        signal=request.signal
+    )
