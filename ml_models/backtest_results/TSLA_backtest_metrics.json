@@ -1,9 +1,19 @@
 {
-    "ticker": "TSLA",
-    "total_trading_days": 451,
-    "strategy_return_pct": 18184.7,
-    "buyhold_return_pct": -16.63,
-    "win_rate_pct": 95.09,
-    "max_drawdown_pct": -6.64,
-    "sharpe_ratio": 8.1834
+  "ticker": "TSLA",
+  "test_period_start": "2026-04-13",
+  "test_period_end": "2026-10-23",
+  "test_days": 136,
+  "total_trades": 31,
+  "win_rate_pct": 46.03,
+  "accuracy_pct": 47.06,
+  "precision_pct": 46.03,
+  "f1_score": 0.4462,
+  "total_return_pct": 9.02,
+  "buy_hold_return_pct": 5.62,
+  "excess_return_pct": 3.4,
+  "sharpe_ratio": 0.52,
+  "sortino_ratio": 0.66,
+  "max_drawdown_pct": -15.29,
+  "profit_factor": 1.17,
+  "annualized_volatility_pct": 32.01
 }

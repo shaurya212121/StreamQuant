@@ -1,9 +1,19 @@
 {
-    "ticker": "GOOGL",
-    "total_trading_days": 451,
-    "strategy_return_pct": 2311.25,
-    "buyhold_return_pct": 74.12,
-    "win_rate_pct": 90.34,
-    "max_drawdown_pct": -3.59,
-    "sharpe_ratio": 8.2343
+  "ticker": "GOOGL",
+  "test_period_start": "2026-04-13",
+  "test_period_end": "2026-10-23",
+  "test_days": 136,
+  "total_trades": 1,
+  "win_rate_pct": 48.53,
+  "accuracy_pct": 48.53,
+  "precision_pct": 48.53,
+  "f1_score": 0.6535,
+  "total_return_pct": -0.27,
+  "buy_hold_return_pct": -0.22,
+  "excess_return_pct": -0.05,
+  "sharpe_ratio": 0.02,
+  "sortino_ratio": 0.03,
+  "max_drawdown_pct": -21.05,
+  "profit_factor": 1.03,
+  "annualized_volatility_pct": 33.72
 }

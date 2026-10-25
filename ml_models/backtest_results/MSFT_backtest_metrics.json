@@ -1,9 +1,19 @@
 {
-    "ticker": "MSFT",
-    "total_trading_days": 451,
-    "strategy_return_pct": 1200.13,
-    "buyhold_return_pct": 15.78,
-    "win_rate_pct": 95.11,
-    "max_drawdown_pct": -3.93,
-    "sharpe_ratio": 6.8331
+  "ticker": "MSFT",
+  "test_period_start": "2026-04-13",
+  "test_period_end": "2026-10-23",
+  "test_days": 136,
+  "total_trades": 21,
+  "win_rate_pct": 53.72,
+  "accuracy_pct": 52.21,
+  "precision_pct": 53.72,
+  "f1_score": 0.6667,
+  "total_return_pct": 29.24,
+  "buy_hold_return_pct": 37.01,
+  "excess_return_pct": -7.77,
+  "sharpe_ratio": 1.43,
+  "sortino_ratio": 3.03,
+  "max_drawdown_pct": -22.24,
+  "profit_factor": 1.36,
+  "annualized_volatility_pct": 34.05
 }

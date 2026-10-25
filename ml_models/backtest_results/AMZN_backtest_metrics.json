@@ -1,9 +1,19 @@
 {
-    "ticker": "AMZN",
-    "total_trading_days": 451,
-    "strategy_return_pct": 2200.75,
-    "buyhold_return_pct": 7.8,
-    "win_rate_pct": 94.32,
-    "max_drawdown_pct": -2.32,
-    "sharpe_ratio": 7.6154
+  "ticker": "AMZN",
+  "test_period_start": "2026-04-13",
+  "test_period_end": "2026-10-23",
+  "test_days": 136,
+  "total_trades": 1,
+  "win_rate_pct": 44.85,
+  "accuracy_pct": 44.85,
+  "precision_pct": 44.85,
+  "f1_score": 0.6193,
+  "total_return_pct": 3.33,
+  "buy_hold_return_pct": 3.38,
+  "excess_return_pct": -0.05,
+  "sharpe_ratio": 0.22,
+  "sortino_ratio": 0.45,
+  "max_drawdown_pct": -17.58,
+  "profit_factor": 1.07,
+  "annualized_volatility_pct": 35.88
 }

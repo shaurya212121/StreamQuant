@@ -1,9 +1,19 @@
 {
-    "ticker": "NVDA",
-    "total_trading_days": 451,
-    "strategy_return_pct": 7641.93,
-    "buyhold_return_pct": 66.15,
-    "win_rate_pct": 93.47,
-    "max_drawdown_pct": -11.03,
-    "sharpe_ratio": 8.3817
+  "ticker": "NVDA",
+  "test_period_start": "2026-04-13",
+  "test_period_end": "2026-10-23",
+  "test_days": 136,
+  "total_trades": 51,
+  "win_rate_pct": 46.91,
+  "accuracy_pct": 47.79,
+  "precision_pct": 46.91,
+  "f1_score": 0.517,
+  "total_return_pct": -2.75,
+  "buy_hold_return_pct": 11.69,
+  "excess_return_pct": -14.44,
+  "sharpe_ratio": -0.16,
+  "sortino_ratio": -0.21,
+  "max_drawdown_pct": -22.29,
+  "profit_factor": 1.0,
+  "annualized_volatility_pct": 31.19
 }

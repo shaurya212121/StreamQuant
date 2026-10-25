@@ -1,9 +1,19 @@
 {
-    "ticker": "AAPL",
-    "total_trading_days": 451,
-    "strategy_return_pct": 1497.34,
-    "buyhold_return_pct": 34.98,
-    "win_rate_pct": 98.7,
-    "max_drawdown_pct": -3.46,
-    "sharpe_ratio": 8.0612
+  "ticker": "AAPL",
+  "test_period_start": "2026-04-13",
+  "test_period_end": "2026-10-23",
+  "test_days": 136,
+  "total_trades": 11,
+  "win_rate_pct": 56.88,
+  "accuracy_pct": 55.88,
+  "precision_pct": 56.88,
+  "f1_score": 0.6739,
+  "total_return_pct": 36.65,
+  "buy_hold_return_pct": 34.39,
+  "excess_return_pct": 2.26,
+  "sharpe_ratio": 2.5,
+  "sortino_ratio": 3.31,
+  "max_drawdown_pct": -12.71,
+  "profit_factor": 1.67,
+  "annualized_volatility_pct": 22.37
 }
