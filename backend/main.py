@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 import sys
@@ -14,7 +15,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
 from db.models import StockPrice, StockNewsSentiment 
 from backend.worker import celery_app, run_batch_sentiment
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from backend.execution import alpaca_executor
 import os
 from dotenv import load_dotenv
@@ -31,8 +32,9 @@ RATE_LIMIT_WINDOW_SECONDS = 60  # Time window (1 minute)
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
-    # Only rate-limit API endpoints, skip docs and health checks
-    if request.url.path.startswith("/api/"):
+    # Protect API and trading endpoints from broker rate-limit exhaustion
+    exempt_paths = {"/docs", "/redoc", "/openapi.json"}
+    if request.url.path not in exempt_paths:
         client_ip = request.client.host if request.client else "unknown"
         rate_key = f"rate_limit:{client_ip}"
 
@@ -462,8 +464,23 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
 
 class TradeRequest(BaseModel):
     symbol: str = Field(..., example="AAPL")
-    qty: float = Field(..., gt=0, example=1.0)
     signal: str = Field(..., example="STRONG BUY")
+    qty: Optional[float] = Field(None, gt=0, example=10.0, description="Manual share count. If None or sizing_mode='auto', dynamic risk sizing is used.")
+    sizing_mode: Optional[str] = Field("auto", example="auto", description="Execution mode: 'auto' (AI conviction-weighted risk sizing) or 'manual'.")
+    confidence_pct: Optional[float] = Field(100.0, ge=0.0, le=100.0, example=85.0, description="Model prediction confidence percentage.")
+
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, v: str) -> str:
+        clean = v.strip().upper()
+        if not clean or len(clean) > 10 or not clean.replace(".", "").replace("/", "").isalnum():
+            raise ValueError(f"Invalid stock ticker symbol: '{v}'. Must be valid alphanumeric ticker.")
+        return clean
+
+    @field_validator("signal")
+    @classmethod
+    def validate_signal(cls, v: str) -> str:
+        return v.strip().upper()
 
 @app.get("/portfolio-summary")
 def get_portfolio_summary():
@@ -484,10 +501,15 @@ def get_recent_orders():
 def execute_trade(request: TradeRequest):
     """
     Receives trade triggers from the UI, validates them through Pydantic,
-    and routes them through the execution engine's risk firewall.
+    and routes them through the execution engine's risk firewall and position sizing engine.
     """
-    return alpaca_executor.execute_trade_signal(
+    result = alpaca_executor.execute_trade_signal(
         symbol=request.symbol,
+        signal=request.signal,
         qty=request.qty,
-        signal=request.signal
+        sizing_mode=request.sizing_mode or "auto",
+        confidence_pct=request.confidence_pct if request.confidence_pct is not None else 100.0
     )
+    if not result.get("success", False):
+        raise HTTPException(status_code=400, detail=result.get("error", "Trade execution failed."))
+    return result
