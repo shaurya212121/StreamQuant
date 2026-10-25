@@ -32,6 +32,6 @@ streamlit>=1.31.0
 plotly>=5.18.0
 
 # Load Testing & Benchmarking
-locust>=2.23.0\
+locust>=2.23.0
 
 alpaca-py>=0.20.0
