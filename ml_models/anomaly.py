@@ -11,6 +11,7 @@ sys.path.append(str(Path(__file__).resolve().parent.parent))
 
 from sqlalchemy import select, update  # noqa: E402
 
+from backend.cleaner import calculate_volume_zscore  # noqa: E402
 from db.database import SessionLocal, engine  # noqa: E402
 from db.models import StockPrice  # noqa: E402
 
@@ -36,15 +37,6 @@ def fetch_recent_data(ticker: str, lookback_days: int = 90) -> pd.DataFrame:
         raise
 
     return df.sort_values("date").reset_index(drop=True)
-
-
-def calculate_rolling_zscore(series: pd.Series, window: int = DEFAULT_WINDOW) -> pd.Series:
-    rolling_mean = series.rolling(window=window, min_periods=window).mean()
-    rolling_std = series.rolling(window=window, min_periods=window).std()
-
-    safe_std = rolling_std.replace(0, np.nan)
-
-    return (series - rolling_mean) / safe_std
 
 
 def flag_anomalies(
@@ -73,7 +65,7 @@ def detect_volume_anomalies(
 
     needs_computation = zscore_col not in result.columns or result[zscore_col].isna().all()
     if needs_computation:
-        result[zscore_col] = calculate_rolling_zscore(result[volume_col], window=window)
+        result[zscore_col] = calculate_volume_zscore(result[volume_col], window=window)
 
     return flag_anomalies(result, zscore_col=zscore_col, threshold=threshold, two_sided=two_sided)
 

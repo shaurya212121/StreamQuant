@@ -48,3 +48,23 @@ def test_calculate_volume_zscore_handles_flat_variance():
     z = calculate_volume_zscore(flat_volume, window=20)
     assert len(z) == 30
     assert not np.isinf(z).any()
+
+
+def test_volume_zscore_flat_window_is_zero():
+    """Every bar equals the mean, so the z-score is exactly 0 (not NaN or inf)."""
+    z = calculate_volume_zscore(pd.Series([1000.0] * 30), window=20)
+    assert (z.iloc[19:] == 0.0).all()
+
+
+def test_volume_zscore_warmup_rows_are_nan():
+    """No full baseline yet means unknown (NaN), not 'normal' (0)."""
+    z = calculate_volume_zscore(pd.Series(range(1, 31), dtype=float), window=20)
+    assert z.iloc[:19].isna().all()
+    assert z.iloc[19:].notna().all()
+
+
+def test_volume_zscore_matches_formula():
+    volume = pd.Series([100.0, 120.0, 80.0, 110.0, 300.0])
+    z = calculate_volume_zscore(volume, window=5)
+    expected = (300.0 - volume.mean()) / volume.std()
+    assert np.isclose(z.iloc[-1], expected)

@@ -1,5 +1,6 @@
 from celery import Celery
 from celery.schedules import crontab
+import random
 import sys
 import time
 import ssl  
@@ -47,18 +48,58 @@ def run_heavy_ml_model(ticker: str):
     return {"ticker": ticker, "status": "ML_COMPLETE"}
 
 
-@celery_app.task(bind=True, max_retries=2, default_retry_delay=300)
-def run_daily_data_pipeline(self):
-    """Fetch latest day's data, validate with Pydantic, upsert into Supabase."""
+# Ingestion retry policy: 60s, 120s, 240s, 480s, 960s (plus jitter) ≈ 31 min worst case,
+# long enough to ride out a Yahoo Finance rate-limit window.
+INGEST_MAX_RETRIES = 5
+INGEST_BACKOFF_BASE_SECONDS = 60
+INGEST_BACKOFF_MAX_SECONDS = 30 * 60
+
+
+def retry_countdown(retries: int) -> float:
+    """Exponential backoff with jitter for the given number of retries so far.
+
+    The delay doubles each attempt (capped), and half of it is randomised so
+    tickers throttled at the same moment don't all retry in lock-step.
+    """
+    delay = min(INGEST_BACKOFF_BASE_SECONDS * (2 ** retries), INGEST_BACKOFF_MAX_SECONDS)
+    return delay / 2 + random.uniform(0, delay / 2)
+
+
+def _ensure_backend_on_path():
     # data_engine uses top-level imports (cleaner, stock), so backend/ must be on sys.path
     backend_dir = str(Path(__file__).resolve().parent)
     if backend_dir not in sys.path:
         sys.path.insert(0, backend_dir)
-    from data_engine import run_daily_pipeline
+
+
+@celery_app.task(bind=True, max_retries=INGEST_MAX_RETRIES)
+def ingest_ticker_task(self, symbol: str):
+    """Fetch and store missing bars for one ticker, retrying transient failures with backoff."""
+    _ensure_backend_on_path()
+    from data_engine import TRANSIENT_ERRORS, ingest_ticker
+
     try:
-        return run_daily_pipeline()
-    except Exception as exc:
-        raise self.retry(exc=exc)
+        return {"ticker": symbol, "result": ingest_ticker(symbol)}
+    except TRANSIENT_ERRORS as exc:
+        countdown = retry_countdown(self.request.retries)
+        print(
+            f"[WORKER] ⏳ {symbol} ingestion failed ({exc}); retry "
+            f"{self.request.retries + 1}/{INGEST_MAX_RETRIES} in {countdown:.0f}s"
+        )
+        raise self.retry(exc=exc, countdown=countdown)
+
+
+@celery_app.task
+def run_daily_data_pipeline():
+    """Market-close job: queue one independently-retried ingestion task per ticker.
+
+    Splitting per ticker means a throttled or failing ticker retries on its own
+    schedule without blocking or re-running the tickers that already succeeded.
+    """
+    _ensure_backend_on_path()
+    from data_engine import TICKERS
+
+    return {symbol: ingest_ticker_task.delay(symbol).id for symbol in TICKERS}
 
 # FLAW #11 FIX: Decoupled FinBERT execution background task
 @celery_app.task(bind=True, max_retries=3, default_retry_delay=60)

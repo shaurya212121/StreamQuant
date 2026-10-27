@@ -10,8 +10,14 @@ Run this script anytime in terminal:
     python ml_models/features_reference.py
 """
 
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+
+sys.path.append(str(Path(__file__).resolve().parent.parent))
+from backend.cleaner import calculate_volume_zscore as _volume_zscore  # noqa: E402
 
 
 # =============================================================================
@@ -129,10 +135,8 @@ def calculate_volume_zscore(volume_series: pd.Series, window: int = 20) -> pd.Se
        - Z > 3.0 (WHALE ALERT): Extreme volume spike occurring in <0.3% of normal days.
          Signals institutional funds or banks actively entering or exiting.
     """
-    rolling_mean = volume_series.rolling(window=window, min_periods=window).mean()
-    rolling_std = volume_series.rolling(window=window, min_periods=window).std()
-    zscore = (volume_series - rolling_mean) / rolling_std.replace(0, np.nan)
-    return zscore.fillna(0.0)
+    # Same implementation the pipeline uses (backend/cleaner.py), so this reference can't drift
+    return _volume_zscore(volume_series, window=window)
 
 
 # =============================================================================

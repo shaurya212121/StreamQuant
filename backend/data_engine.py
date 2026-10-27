@@ -9,9 +9,10 @@ from pathlib import Path
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.exc import OperationalError
 from db.database import SessionLocal, engine
 from db.models import StockPrice, Base
-from cleaner import prune_metadata_columns, handle_missing_values
+from cleaner import calculate_volume_zscore, handle_missing_values, prune_metadata_columns
 from stock import StockRecordSchema
 
 logger = logging.getLogger("streamquant.data_engine")
@@ -147,9 +148,7 @@ def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     df["daily_return"] = df["Close"].pct_change()
 
     # 3. Anomaly features (rolling volume stats)
-    vol_mean = df["Volume"].rolling(window=20).mean()
-    vol_std = df["Volume"].rolling(window=20).std()
-    df["volume_z_score"] = (df["Volume"] - vol_mean) / vol_std
+    df["volume_z_score"] = calculate_volume_zscore(df["Volume"], window=20)
 
     # 4. Inject advanced quantitative risk & volatility features
     df = add_advanced_features(df)
@@ -291,44 +290,72 @@ def select_rows_to_store(
     return df.iloc[max(0, first_new - overlap_bars):]
 
 
-def run_daily_pipeline(tickers: list[str] | None = None, overlap_bars: int = OVERLAP_BARS) -> dict:
-    """Store every bar missing from PostgreSQL since the last stored date, for each ticker.
+class DataFetchError(RuntimeError):
+    """Yahoo Finance returned no usable history for a ticker we know exists.
+
+    yf.download swallows rate-limit (HTTP 429) and network errors and returns an
+    empty frame instead of raising, so for our fixed ticker universe an empty
+    result is treated as a transient failure worth retrying.
+    """
+
+
+# Failures that are likely to succeed on a later attempt. Anything else (a bug,
+# a validation error) fails immediately instead of being retried.
+TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
+    DataFetchError,
+    ConnectionError,
+    TimeoutError,
+    OperationalError,
+)
+
+
+def ingest_ticker(symbol: str, overlap_bars: int = OVERLAP_BARS) -> str:
+    """Fetch, enrich and store every bar missing for one ticker. Raises on failure.
 
     A worker outage of N days is backfilled on the next run instead of leaving
     permanent gaps. Features are computed on the full 2y history so rolling
     windows are correct, but only the missing (and overlap) bars are written.
+    """
+    print(f"\n--- Daily job: {symbol} ---")
+    df = fetch_and_prepare_data(symbol, period="2y")
+    if df.empty:
+        raise DataFetchError(
+            f"Yahoo Finance returned no data for {symbol} (likely rate-limited or a network error)."
+        )
+
+    last_stored = get_last_stored_date(symbol)
+    if last_stored is not None and df["date"].iloc[0] > pd.Timestamp(last_stored):
+        logger.warning(
+            "%s: last stored bar is %s but fetched history starts %s; "
+            "bars in between cannot be backfilled from this fetch window.",
+            symbol, last_stored, str(df["date"].iloc[0])[:10],
+        )
+
+    to_store = select_rows_to_store(df, last_stored, overlap_bars)
+    new_bars = to_store if last_stored is None else to_store[to_store["date"] > pd.Timestamp(last_stored)]
+
+    store_data_in_db(to_store, ticker=symbol, update_on_conflict=True)
+
+    if new_bars.empty:
+        return f"up to date ({last_stored})"
+    return (
+        f"ok: {len(new_bars)} new bar(s) "
+        f"{str(new_bars['date'].iloc[0])[:10]} to {str(new_bars['date'].iloc[-1])[:10]}"
+    )
+
+
+def run_daily_pipeline(tickers: list[str] | None = None, overlap_bars: int = OVERLAP_BARS) -> dict:
+    """Run ingest_ticker for each ticker in sequence, continuing past failures.
+
+    For manual runs and scripts. The scheduled Celery job instead runs one
+    retryable task per ticker (see backend/worker.py).
     """
     results: dict = {}
     failures: dict = {}
 
     for symbol in tickers or TICKERS:
         try:
-            print(f"\n--- Daily job: {symbol} ---")
-            df = fetch_and_prepare_data(symbol, period="2y")
-            if df.empty:
-                results[symbol] = "no data"
-                continue
-
-            last_stored = get_last_stored_date(symbol)
-            if last_stored is not None and df["date"].iloc[0] > pd.Timestamp(last_stored):
-                logger.warning(
-                    "%s: last stored bar is %s but fetched history starts %s; "
-                    "bars in between cannot be backfilled from this fetch window.",
-                    symbol, last_stored, str(df["date"].iloc[0])[:10],
-                )
-
-            to_store = select_rows_to_store(df, last_stored, overlap_bars)
-            new_bars = to_store if last_stored is None else to_store[to_store["date"] > pd.Timestamp(last_stored)]
-
-            store_data_in_db(to_store, ticker=symbol, update_on_conflict=True)
-
-            if new_bars.empty:
-                results[symbol] = f"up to date ({last_stored})"
-            else:
-                results[symbol] = (
-                    f"ok: {len(new_bars)} new bar(s) "
-                    f"{str(new_bars['date'].iloc[0])[:10]} to {str(new_bars['date'].iloc[-1])[:10]}"
-                )
+            results[symbol] = ingest_ticker(symbol, overlap_bars)
         except Exception as exc:
             print(f"Daily job failed for {symbol}: {exc}")
             failures[symbol] = str(exc)

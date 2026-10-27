@@ -157,3 +157,49 @@ def test_gap_older_than_fetch_window_is_logged(monkeypatch, caplog):
 
     assert len(stored["df"]) == 120 - 49
     assert "cannot be backfilled" in caplog.text
+
+
+# --- 3.5: empty Yahoo responses are transient errors, not "no data" ----------
+
+def test_empty_yahoo_response_raises_retryable_error(monkeypatch):
+    """yf.download hides rate limits behind an empty frame; that must not count as success."""
+    monkeypatch.setattr(data_engine.yf, "download", lambda *a, **k: pd.DataFrame())
+
+    try:
+        data_engine.ingest_ticker("TEST")
+        raised = None
+    except Exception as exc:
+        raised = exc
+
+    assert isinstance(raised, data_engine.DataFetchError)
+    assert isinstance(raised, data_engine.TRANSIENT_ERRORS)
+
+
+def test_manual_pipeline_reports_failure_and_continues(monkeypatch):
+    raw = _fake_yahoo_history(n_days=120, rally_days=5)
+
+    def flaky_download(ticker, *a, **k):
+        return pd.DataFrame() if ticker == "BAD" else raw.copy()
+
+    monkeypatch.setattr(data_engine.yf, "download", flaky_download)
+    monkeypatch.setattr(data_engine, "get_last_stored_date", lambda ticker: None)
+    monkeypatch.setattr(data_engine, "store_data_in_db", lambda *a, **k: None)
+
+    result = data_engine.run_daily_pipeline(tickers=["BAD", "GOOD"])
+
+    assert "BAD" in result["failed"]
+    assert result["succeeded"]["GOOD"].startswith("ok:")
+
+
+# --- 3.2: ingestion uses the shared volume z-score ----------------------------
+
+def test_ingestion_uses_shared_volume_zscore(monkeypatch):
+    from cleaner import calculate_volume_zscore
+
+    raw = _fake_yahoo_history(n_days=120, rally_days=5)
+    monkeypatch.setattr(data_engine.yf, "download", lambda *a, **k: raw.copy())
+
+    df = fetch_and_prepare_data("TEST")
+    expected = calculate_volume_zscore(raw["Volume"].reset_index(drop=True), window=20).iloc[49:]
+
+    assert np.allclose(df["volume_z_score"].to_numpy(), expected.to_numpy())

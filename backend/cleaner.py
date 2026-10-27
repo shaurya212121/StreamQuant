@@ -48,14 +48,19 @@ def calculate_sma(series: pd.Series, window: int = 20) -> pd.Series:
 
 def calculate_volume_zscore(volume: pd.Series, window: int = 20) -> pd.Series:
     """
-    Calculate volume Z-score using backward-looking 20-day rolling statistics.
-    Prevents Lookahead Bias by never aggregating future rows.
+    Volume Z-score: (volume - rolling mean) / rolling std over the last `window` bars.
+
+    This is the single implementation used by ingestion (data_engine), anomaly
+    detection and the feature reference script. Backward-looking only, so no
+    lookahead bias. Edge cases:
+    - first `window - 1` rows (no full baseline yet) -> NaN: unknown, not "normal"
+    - flat window (std == 0, so every bar equals the mean) -> 0.0
     """
     rolling_mean = volume.rolling(window=window, min_periods=window).mean()
     rolling_std = volume.rolling(window=window, min_periods=window).std()
 
     zscore = (volume - rolling_mean) / rolling_std.replace(0, np.nan)
-    return zscore.fillna(0.0)
+    return zscore.mask(rolling_std == 0, 0.0)
 
 
 def clean_and_enrich(df: pd.DataFrame, sma_window: int = 20) -> pd.DataFrame:
