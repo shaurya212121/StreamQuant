@@ -1,17 +1,5 @@
 services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: finsignal_postgres
-    restart: always
-    environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: password123
-      POSTGRES_DB: finsignal
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
+  
   redis:
     image: redis:7-alpine
     container_name: finsignal_redis
@@ -29,8 +17,5 @@ services:
     # Single process runs both the Celery worker and the Beat scheduler.
     # Run exactly one instance of this service, or the daily job will fire twice.
     command: >
-      sh -c "pip install --no-cache-dir celery redis yfinance pandas 'sqlalchemy>=2.0,<2.1' psycopg2-binary pydantic &&
+      sh -c "pip install --no-cache-dir -r requirements.txt &&
              celery -A backend.worker worker --beat --loglevel=info --concurrency=1"
-
-volumes:
-  postgres_data:

@@ -217,3 +217,5 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 ml_models/backtest_results/
+generate_master_pdf.py
+StreamQuant_Architecture_Dossier.pdf

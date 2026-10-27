@@ -5,11 +5,23 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 from dotenv import load_dotenv
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
+try:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestTradeRequest
+    ALPACA_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    TradingClient = None
+    MarketOrderRequest = None
+    GetOrdersRequest = None
+    OrderSide = None
+    TimeInForce = None
+    QueryOrderStatus = None
+    StockHistoricalDataClient = None
+    StockLatestTradeRequest = None
+    ALPACA_AVAILABLE = False
 import yfinance as yf
 
 # Defensively load .env from project root
@@ -30,8 +42,12 @@ class AlpacaExecutionEngine:
         # 2. FRM Guardrail: Strictly enforce paper trading mode
         self.paper = True 
 
-        # 3. Defensive Initialization Check
-        if not self.api_key or not self.api_secret:
+        # 3. Defensive Initialization Check (Package Availability & Credentials)
+        if not ALPACA_AVAILABLE:
+            logger.warning("alpaca-py package is not installed. Running in mock/offline mode.")
+            self.client = None
+            self.data_client = None
+        elif not self.api_key or not self.api_secret:
             logger.warning("Alpaca API credentials missing. Running in mock/offline mode.")
             self.client = None
             self.data_client = None
@@ -237,9 +253,10 @@ class AlpacaExecutionEngine:
         Executes a paper market order based on model signal confluence.
         Thread-safe, pre-trade risk checked, and validated against market hours.
         """
-        # Guard 1: Ensure client is initialized (credentials present)
+        # Guard 1: Ensure client is initialized (credentials present & package installed)
         if not self.client:
-            return {"success": False, "error": "Alpaca client not initialized. Check API keys."}
+            err_msg = "Alpaca client not initialized. Check API keys or install alpaca-py." if not ALPACA_AVAILABLE else "Alpaca client not initialized. Check API keys."
+            return {"success": False, "error": err_msg}
 
         # Sanitize symbol and signal
         clean_symbol = symbol.strip().upper()
