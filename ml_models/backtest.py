@@ -4,7 +4,12 @@ StreamQuant Out-of-Sample Backtest Engine
 Strict 70% Train / 30% Unseen Test split with 0.05% trade slippage.
 Produces honest, uncontaminated performance metrics and equity curves.
 
-Data Source: yfinance (self-contained, no DB dependency for backtesting)
+Data Source: yfinance (no DB dependency for backtesting). Features come from the
+same pipeline the live system uses (backend/data_engine.py), so the backtest
+measures exactly the features the deployed models see.
+
+Note: this trains its own model on the first 70% of the window, so it measures
+the modelling approach out-of-sample, not the deployed model files.
 
 Output:
   ml_models/backtest_results/{TICKER}_backtest_metrics.json
@@ -15,22 +20,29 @@ Output:
 import sys
 import json
 import logging
+import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from dataclasses import dataclass, asdict
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import xgboost as xgb
 from sklearn.metrics import accuracy_score, precision_score, f1_score
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
+# data_engine uses top-level imports (cleaner, stock), so backend/ must be on sys.path
+sys.path.insert(0, str(ROOT_DIR / "backend"))
+from data_engine import FEATURE_COLUMNS, fetch_and_prepare_data as _fetch_production_features  # noqa: E402
+
 logger = logging.getLogger("streamquant.backtest")
 
 # ── Constants ────────────────────────────────────────────────────────
-FEATURE_COLS = [
-    "sma_ratio", "macd", "rsi", "daily_return",
-    "volume_z_score", "rolling_sharpe", "rolling_max_drawdown", "atr_20"
-]
+FEATURE_COLS = FEATURE_COLUMNS
 
+DATA_PERIOD = "5y"               # ~1,200 bars -> ~360 unseen test days per ticker
 TRAIN_RATIO = 0.70               # 70% train, 30% unseen test
 SLIPPAGE_PCT = 0.0005            # 0.05% per trade (realistic institutional cost)
 TRADING_DAYS_PER_YEAR = 252
@@ -40,6 +52,27 @@ INITIAL_CAPITAL = 10_000.0       # $10,000 starting capital
 RESULTS_DIR = Path(__file__).resolve().parent / "backtest_results"
 
 TICKERS = ["AAPL", "AMZN", "GOOGL", "MSFT", "NVDA", "TSLA"]
+
+MODEL_PARAMS = dict(
+    n_estimators=200,
+    learning_rate=0.03,
+    max_depth=4,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    eval_metric="logloss",
+    early_stopping_rounds=15,
+)
+
+
+def _git_commit() -> Optional[str]:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=ROOT_DIR,
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+    except Exception:
+        return None
 
 
 @dataclass
@@ -64,92 +97,28 @@ class BacktestMetrics:
     sharpe_ratio: float
     sortino_ratio: float
     max_drawdown_pct: float
-    profit_factor: float
+    profit_factor: Optional[float]   # None when the strategy had no losing days (would be Infinity)
     annualized_volatility_pct: float
 
+    # Provenance: what these numbers describe
+    train_period_start: str
+    train_period_end: str
+    train_days: int
+    data_period: str
+    features: list
+    model_params: dict
+    slippage_pct: float
+    generated_at: str
+    git_commit: Optional[str]
 
-def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
-    """
-    Fetch OHLCV data from yfinance and compute all 8 features locally.
-    Self-contained — no DB dependency.
-    """
-    import yfinance as yf
 
+def fetch_and_prepare_data(ticker: str, period: str = DATA_PERIOD) -> pd.DataFrame:
+    """OHLCV + all 8 features, computed by the live ingestion pipeline (backend/data_engine.py)."""
     logger.info("Fetching %s data from yfinance (%s) ...", ticker, period)
-    df = yf.download(ticker, period=period, interval="1d", multi_level_index=False)
-
+    df = _fetch_production_features(ticker, period=period)
     if df.empty:
         raise ValueError(f"No data returned from yfinance for {ticker}")
-
-    # Flatten MultiIndex columns if needed
-    if isinstance(df.columns, pd.MultiIndex):
-        df.columns = df.columns.get_level_values(0)
-
-    df = df.reset_index()
-
-    # Standardize date column name
-    date_col = None
-    for col in df.columns:
-        if str(col).lower() in ["date", "datetime", "index", "level_0"]:
-            date_col = col
-            break
-    if date_col is None:
-        date_col = df.columns[0]
-    df = df.rename(columns={date_col: "date"})
-
-    df = df[["date", "Open", "High", "Low", "Close", "Volume"]].copy()
-
-    # Strip timezone if present
-    if pd.api.types.is_datetime64tz_dtype(df["date"]):
-        df["date"] = df["date"].dt.tz_convert("UTC").dt.tz_localize(None)
-
-    # ── Feature Engineering ──────────────────────────────────────────
-    # SMA Ratio
-    sma_10 = df["Close"].rolling(window=10).mean()
-    sma_50 = df["Close"].rolling(window=50).mean()
-    df["sma_ratio"] = (sma_10 - sma_50) / sma_50
-
-    # MACD
-    ema_12 = df["Close"].ewm(span=12, adjust=False).mean()
-    ema_26 = df["Close"].ewm(span=26, adjust=False).mean()
-    df["macd"] = ema_12 - ema_26
-
-    # RSI (14-day)
-    delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    # Daily return
-    df["daily_return"] = df["Close"].pct_change()
-
-    # Volume Z-score
-    vol_mean = df["Volume"].rolling(window=20).mean()
-    vol_std = df["Volume"].rolling(window=20).std()
-    df["volume_z_score"] = (df["Volume"] - vol_mean) / vol_std
-
-    # Rolling Sharpe
-    daily_returns = df["Close"].pct_change()
-    rolling_mean = daily_returns.rolling(window=20).mean()
-    rolling_std = daily_returns.rolling(window=20).std()
-    df["rolling_sharpe"] = ((rolling_mean / (rolling_std + 1e-6)) * (252 ** 0.5)).astype(float)
-
-    # Rolling Max Drawdown
-    rolling_max = df["Close"].rolling(window=20).max()
-    df["rolling_max_drawdown"] = ((df["Close"] - rolling_max) / rolling_max).astype(float)
-
-    # ATR-20
-    high_low = df["High"] - df["Low"]
-    high_close = (df["High"] - df["Close"].shift()).abs()
-    low_close = (df["Low"] - df["Close"].shift()).abs()
-    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
-    df["atr_20"] = tr.rolling(window=20).mean().astype(float)
-
-    # Lowercase columns to match expected feature names
-    df.columns = [c.lower() for c in df.columns]
-
-    return df.dropna().reset_index(drop=True)
+    return df
 
 
 def run_backtest(ticker: str) -> tuple[BacktestMetrics, pd.DataFrame]:
@@ -173,8 +142,12 @@ def run_backtest(ticker: str) -> tuple[BacktestMetrics, pd.DataFrame]:
 
     # ── 2. Engineer Target ───────────────────────────────────────────
     df["tomorrow_close"] = df["close"].shift(-1)
-    df["price_went_up"] = (df["tomorrow_close"] > df["close"]).astype(int)
+    # The last bar has no "tomorrow"; leave its label NaN so it is dropped, instead of
+    # (NaN > close) silently becoming 0 = "price went down"
+    df["price_went_up"] = (df["tomorrow_close"] > df["close"]).astype(float)
+    df.loc[df["tomorrow_close"].isna(), "price_went_up"] = np.nan
     clean_df = df.dropna(subset=["price_went_up"] + FEATURE_COLS).copy()
+    clean_df["price_went_up"] = clean_df["price_went_up"].astype(int)
     clean_df = clean_df.reset_index(drop=True)
 
     # ── 3. Strict 70/30 Chronological Split ──────────────────────────
@@ -196,16 +169,7 @@ def run_backtest(ticker: str) -> tuple[BacktestMetrics, pd.DataFrame]:
     )
 
     # ── 4. Train Model on Train Set ONLY ─────────────────────────────
-    model = xgb.XGBClassifier(
-        n_estimators=200,
-        learning_rate=0.03,
-        max_depth=4,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        random_state=42,
-        eval_metric="logloss",
-        early_stopping_rounds=15
-    )
+    model = xgb.XGBClassifier(**MODEL_PARAMS)
 
     # Use last 20% of train set as validation for early stopping
     val_split = int(len(X_train) * 0.80)
@@ -290,7 +254,8 @@ def run_backtest(ticker: str) -> tuple[BacktestMetrics, pd.DataFrame]:
     # Profit factor
     gains = strat_returns[strat_returns > 0].sum()
     losses = abs(strat_returns[strat_returns < 0].sum())
-    profit_factor = gains / losses if losses > 0 else float("inf")
+    # None instead of Infinity: Infinity is not valid JSON and breaks the /backtest API
+    profit_factor = round(float(gains / losses), 2) if losses > 0 else None
 
     # Annualized volatility
     ann_vol = strat_returns.std() * np.sqrt(TRADING_DAYS_PER_YEAR) * 100
@@ -311,8 +276,17 @@ def run_backtest(ticker: str) -> tuple[BacktestMetrics, pd.DataFrame]:
         sharpe_ratio=round(float(sharpe), 2),
         sortino_ratio=round(float(sortino), 2),
         max_drawdown_pct=round(float(max_dd), 2),
-        profit_factor=round(float(profit_factor), 2),
+        profit_factor=profit_factor,
         annualized_volatility_pct=round(float(ann_vol), 2),
+        train_period_start=str(train_df["date"].iloc[0])[:10],
+        train_period_end=str(train_df["date"].iloc[-1])[:10],
+        train_days=len(train_df),
+        data_period=DATA_PERIOD,
+        features=list(FEATURE_COLS),
+        model_params=dict(MODEL_PARAMS),
+        slippage_pct=SLIPPAGE_PCT,
+        generated_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        git_commit=_git_commit(),
     )
 
     # Build equity curve export DataFrame
@@ -327,10 +301,10 @@ def export_results(ticker: str, metrics: BacktestMetrics, equity_df: pd.DataFram
     """Write metrics JSON and equity curve CSV to backtest_results/."""
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Export metrics JSON
+    # Export metrics JSON (allow_nan=False: fail loudly rather than write invalid JSON)
     metrics_path = RESULTS_DIR / f"{ticker}_backtest_metrics.json"
     with open(metrics_path, "w") as f:
-        json.dump(asdict(metrics), f, indent=2)
+        json.dump(asdict(metrics), f, indent=2, allow_nan=False)
     logger.info("Exported metrics -> %s", metrics_path)
 
     # Export equity curve CSV
@@ -343,7 +317,7 @@ def run_all_backtests():
     """Run backtest for all 6 tickers and export clean results."""
     print("\n" + "=" * 60)
     print("  StreamQuant Out-of-Sample Backtest Engine")
-    print("  70% Train / 30% Unseen Test | 0.05% Slippage")
+    print(f"  {DATA_PERIOD} data | 70% Train / 30% Unseen Test | 0.05% Slippage")
     print("=" * 60)
 
     all_metrics = {}
@@ -371,7 +345,7 @@ def run_all_backtests():
         summary_path = RESULTS_DIR / "all_tickers_summary.json"
         summary = {t: asdict(m) for t, m in all_metrics.items()}
         with open(summary_path, "w") as f:
-            json.dump(summary, f, indent=2)
+            json.dump(summary, f, indent=2, allow_nan=False)
         print(f"\n[OK] Combined summary exported -> {summary_path}")
 
     return all_metrics

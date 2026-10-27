@@ -216,6 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
-ml_models/backtest_results/
+# ml_models/backtest_results/ is committed on purpose: the /api/stocks/{ticker}/backtest endpoint serves it
 generate_master_pdf.py
 StreamQuant_Architecture_Dossier.pdf

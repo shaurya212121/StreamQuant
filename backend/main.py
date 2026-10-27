@@ -8,8 +8,9 @@ from pathlib import Path
 import xgboost as xgb
 import pandas as pd
 from celery.result import AsyncResult
-import redis 
+import redis
 import json
+import math
 from fastapi.responses import JSONResponse
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
@@ -88,6 +89,57 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# Volume spikes beyond this many standard deviations are flagged as anomalies (all endpoints)
+ANOMALY_Z_THRESHOLD = 3.0
+
+# Feature order the models were trained on (ml_models/train_xgb.py). Only used if a
+# model file has no saved feature names; normally the model's own names are used.
+MODEL_FEATURES = [
+    "sma_ratio", "macd", "rsi", "daily_return",
+    "volume_z_score", "rolling_sharpe", "rolling_max_drawdown", "atr_20",
+]
+
+
+def build_feature_frame(record, model) -> tuple[Optional[pd.DataFrame], list[str]]:
+    """One-row feature frame for `model` from a StockPrice row, in the model's trained order.
+
+    Strict: if any feature is NULL or non-finite, returns (None, missing_names) instead
+    of substituting a default, so callers report UNAVAILABLE rather than predicting
+    on made-up inputs.
+    """
+    feature_names = model.get_booster().feature_names or MODEL_FEATURES
+    values = {name: getattr(record, name, None) for name in feature_names}
+    missing = [
+        name for name, value in values.items()
+        if value is None or not math.isfinite(float(value))
+    ]
+    if missing:
+        return None, missing
+    return pd.DataFrame([{name: float(v) for name, v in values.items()}], columns=feature_names), []
+
+
+def predict_trend(model, features: pd.DataFrame) -> tuple[bool, float]:
+    """(is_bullish, confidence %) for a feature frame from build_feature_frame."""
+    pred = int(model.predict(features)[0])
+    probabilities = model.predict_proba(features)[0]
+    return pred == 1, round(float(probabilities[pred] * 100), 2)
+
+
+def confluence_decision(is_bullish: bool, news_score: float, is_anomaly: bool, vol_z: Optional[float]) -> tuple[str, str]:
+    """Combine ML trend, news sentiment and volume anomaly into one (signal, summary)."""
+    if is_bullish and news_score > 0.15 and not is_anomaly:
+        return "STRONG BUY", "Technical trend is Bullish with supportive news sentiment and stable liquidity."
+    if is_bullish and news_score < -0.15:
+        return "CAUTIOUS BUY (DIVERGENCE)", "Model predicts upward trend, but news sentiment is Negative. Watch for headline risk."
+    if not is_bullish and news_score < -0.15:
+        return "STRONG SELL", "Technical trend is Bearish aligned with negative financial news sentiment."
+    if not is_bullish and news_score > 0.15:
+        return "CAUTIOUS SELL (DIVERGENCE)", "Technical trend is Bearish despite positive news sentiment."
+    if is_anomaly:
+        return "HIGH VOLATILITY ALERT", f"Volume spike detected ({vol_z:.2f}σ). Institutional block trades in progress."
+    return "NEUTRAL / HOLD", "Mixed or balanced indicators across technical and sentiment layers."
 
 @app.get("/")
 def health_check():
@@ -217,28 +269,33 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
             detail=f"No trained model found for {ticker}."
         )
 
-    features = pd.DataFrame([{
-        "sma_ratio": latest_record.sma_ratio or 0.0,
-        "macd": latest_record.macd or 0.0,
-        "rsi": latest_record.rsi or 50.0,
-        "daily_return": latest_record.daily_return or 0.0,
-        "volume_z_score": latest_record.volume_z_score or 0.0,
-        "rolling_sharpe": getattr(latest_record, "rolling_sharpe", 0.0) or 0.0,
-        "rolling_max_drawdown": getattr(latest_record, "rolling_max_drawdown", 0.0) or 0.0,
-        "atr_20": getattr(latest_record, "atr_20", 0.0) or 0.0
-    }])
+    features, missing = build_feature_frame(latest_record, model)
+    if features is None:
+        # Not cached, so the prediction appears as soon as the features are ingested
+        return {
+            "ticker": ticker,
+            "status": "UNAVAILABLE",
+            "reason": f"Insufficient historical data: missing features {missing}",
+            "missing_features": missing,
+            "latest_close": latest_record.close,
+            "trend_prediction": "UNAVAILABLE",
+            "confidence_pct": None,
+            "volume_z_score": latest_record.volume_z_score,
+            "is_volume_anomaly": None,
+            "date": str(latest_record.date),
+            "cached": False
+        }
 
-    pred = int(model.predict(features)[0])
-    probabilities = model.predict_proba(features)[0]
-    confidence = float(probabilities[pred] * 100)
+    is_bullish, confidence = predict_trend(model, features)
+    is_anomaly = bool(latest_record.volume_z_score > ANOMALY_Z_THRESHOLD)
 
-    is_anomaly = bool(latest_record.volume_z_score and latest_record.volume_z_score > 3.0)
-    
     result = {
         "ticker": ticker,
+        "status": "OK",
+        "reason": None,
         "latest_close": latest_record.close,
-        "trend_prediction": "BULLISH" if pred == 1 else "BEARISH",
-        "confidence_pct": round(confidence, 2),
+        "trend_prediction": "BULLISH" if is_bullish else "BEARISH",
+        "confidence_pct": confidence,
         "volume_z_score": latest_record.volume_z_score,
         "is_volume_anomaly": is_anomaly,
         "date": str(latest_record.date),
@@ -317,64 +374,46 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
             detail=f"No trained XGBoost model found for '{ticker}'. Available: AAPL, AMZN, GOOGL, MSFT, NVDA, TSLA."
         )
 
-    # 4. Construct Feature Vector (All 8 Features)
-    feature_cols = [
-        "sma_ratio", "macd", "rsi", "daily_return",
-        "volume_z_score", "rolling_sharpe", "rolling_max_drawdown", "atr_20"
-    ]
-    features_df = pd.DataFrame([{
-        "sma_ratio": latest_price.sma_ratio or 0.0,
-        "macd": latest_price.macd or 0.0,
-        "rsi": latest_price.rsi or 50.0,
-        "daily_return": latest_price.daily_return or 0.0,
-        "volume_z_score": latest_price.volume_z_score or 0.0,
-        "rolling_sharpe": getattr(latest_price, "rolling_sharpe", 0.0) or 0.0,
-        "rolling_max_drawdown": getattr(latest_price, "rolling_max_drawdown", 0.0) or 0.0,
-        "atr_20": getattr(latest_price, "atr_20", 0.0) or 0.0
-    }])
+    # 4. Build the feature vector exactly as the model was trained (strict: no defaults)
+    features_df, missing = build_feature_frame(latest_price, model)
+    ml_available = features_df is not None
 
-    # 5. Execute XGBoost Inference
-    pred = int(model.predict(features_df)[0])
-    probabilities = model.predict_proba(features_df)[0]
-    confidence_pct = round(float(probabilities[pred] * 100), 2)
-    is_bullish = (pred == 1)
-
-    # 6. Compute SHAP Top-3 Feature Drivers (Explainability)
+    # 5-6. XGBoost inference and SHAP top-3 drivers (only on real features)
     top_drivers = []
-    try:
-        import shap
-        explainer = shap.TreeExplainer(model)
-        shap_vals = explainer.shap_values(features_df)
-        if isinstance(shap_vals, list):
-            shap_vals = shap_vals[0]
-        shap_vals = shap_vals[0] if shap_vals.ndim > 1 else shap_vals
-        
-        feature_vals = features_df.iloc[0]
-        contributions = []
-        for name, val, s_val in zip(feature_cols, feature_vals, shap_vals):
-            contributions.append({
-                "feature": name,
-                "current_value": round(float(val), 4),
-                "shap_impact": round(float(s_val), 4)
-            })
-        contributions.sort(key=lambda x: abs(x["shap_impact"]), reverse=True)
-        top_drivers = contributions[:3]
-    except Exception as e:
-        print(f"[SHAP NOTICE] Fallback used: {e}")
-        # Graceful fallback: return top features by raw input values if SHAP is absent
-        top_drivers = [
-            {"feature": "rsi", "current_value": round(float(latest_price.rsi or 50), 2), "shap_impact": 0.0},
-            {"feature": "sma_ratio", "current_value": round(float(latest_price.sma_ratio or 0), 4), "shap_impact": 0.0},
-            {"feature": "volume_z_score", "current_value": round(float(latest_price.volume_z_score or 0), 2), "shap_impact": 0.0}
-        ]
+    if ml_available:
+        is_bullish, confidence_pct = predict_trend(model, features_df)
+        try:
+            import shap
+            explainer = shap.TreeExplainer(model)
+            shap_vals = explainer.shap_values(features_df)
+            if isinstance(shap_vals, list):
+                shap_vals = shap_vals[0]
+            shap_vals = shap_vals[0] if shap_vals.ndim > 1 else shap_vals
 
-    # 7. Evaluate Statistical Volume Anomaly (|Z| > 3.0)
-    vol_z = latest_price.volume_z_score or 0.0
-    is_anomaly = bool(vol_z > 3.0)
-    anomaly_alert = (
-        f"WHALE TRADE DETECTED: Volume is +{vol_z:.2f}σ above 20-day mean" 
-        if is_anomaly else "Normal institutional liquidity"
-    )
+            contributions = []
+            for name, val, s_val in zip(features_df.columns, features_df.iloc[0], shap_vals):
+                contributions.append({
+                    "feature": name,
+                    "current_value": round(float(val), 4),
+                    "shap_impact": round(float(s_val), 4)
+                })
+            contributions.sort(key=lambda x: abs(x["shap_impact"]), reverse=True)
+            top_drivers = contributions[:3]
+        except Exception as e:
+            # No made-up drivers: an empty list means explainability is unavailable
+            print(f"[SHAP NOTICE] Explainability unavailable: {e}")
+
+    # 7. Evaluate Statistical Volume Anomaly (Z > ANOMALY_Z_THRESHOLD)
+    vol_z = latest_price.volume_z_score
+    if vol_z is None:
+        is_anomaly = None
+        anomaly_alert = "Unavailable: volume z-score not computed yet"
+    else:
+        is_anomaly = bool(vol_z > ANOMALY_Z_THRESHOLD)
+        anomaly_alert = (
+            f"WHALE TRADE DETECTED: Volume is +{vol_z:.2f}σ above 20-day mean"
+            if is_anomaly else "Normal institutional liquidity"
+        )
 
     # 8. Query Pre-Computed FinBERT News Sentiment
     sentiment_record = (
@@ -408,42 +447,40 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
         }
 
     # 9. Compute Unified Confluence Signal (Combining ML + NLP + Volume)
-    news_score = sentiment_data["sentiment_score"]
-    if is_bullish and news_score > 0.15 and not is_anomaly:
-        signal = "STRONG BUY"
-        summary = "Technical trend is Bullish with supportive news sentiment and stable liquidity."
-    elif is_bullish and news_score < -0.15:
-        signal = "CAUTIOUS BUY (DIVERGENCE)"
-        summary = "Model predicts upward trend, but news sentiment is Negative. Watch for headline risk."
-    elif not is_bullish and news_score < -0.15:
-        signal = "STRONG SELL"
-        summary = "Technical trend is Bearish aligned with negative financial news sentiment."
-    elif not is_bullish and news_score > 0.15:
-        signal = "CAUTIOUS SELL (DIVERGENCE)"
-        summary = "Technical trend is Bearish despite positive news sentiment."
-    elif is_anomaly:
-        signal = "HIGH VOLATILITY ALERT"
-        summary = f"Volume spike detected ({vol_z:.2f}σ). Institutional block trades in progress."
+    if ml_available:
+        signal, summary = confluence_decision(
+            is_bullish, sentiment_data["sentiment_score"], bool(is_anomaly), vol_z
+        )
+        ml_layer = {
+            "status": "OK",
+            "prediction": "BULLISH" if is_bullish else "BEARISH",
+            "confidence_pct": confidence_pct,
+            "top_drivers": top_drivers
+        }
     else:
-        signal = "NEUTRAL / HOLD"
-        summary = "Mixed or balanced indicators across technical and sentiment layers."
+        signal = "UNAVAILABLE"
+        summary = f"ML trend layer unavailable: insufficient historical data (missing features {missing})."
+        ml_layer = {
+            "status": "UNAVAILABLE",
+            "prediction": "UNAVAILABLE",
+            "confidence_pct": None,
+            "top_drivers": [],
+            "missing_features": missing
+        }
 
     # 10. Construct Final Unified Payload
     response_payload = {
         "ticker": ticker,
+        "status": "OK" if ml_available else "UNAVAILABLE",
         "as_of_date": str(latest_price.date),
         "latest_close": round(float(latest_price.close), 2),
         "confluence_decision": {
             "signal": signal,
             "summary": summary
         },
-        "ml_trend_layer": {
-            "prediction": "BULLISH" if is_bullish else "BEARISH",
-            "confidence_pct": confidence_pct,
-            "top_drivers": top_drivers
-        },
+        "ml_trend_layer": ml_layer,
         "statistical_anomaly_layer": {
-            "volume_z_score": round(float(vol_z), 2),
+            "volume_z_score": round(float(vol_z), 2) if vol_z is not None else None,
             "is_anomaly": is_anomaly,
             "alert": anomaly_alert
         },
@@ -451,7 +488,9 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
         "cached": False
     }
 
-    # 11. Save in Redis with 5-minute (300s) TTL
+    # 11. Save in Redis with 5-minute (300s) TTL; never cache an UNAVAILABLE answer
+    if not ml_available:
+        return response_payload
     try:
         redis_payload = response_payload.copy()
         redis_payload["cached"] = True
@@ -587,155 +626,142 @@ def get_market_overview(db: Session = Depends(get_db)):
 
     tickers = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
     overview_list = []
-
     for sym in tickers:
         try:
-            records = None
-            try:
-                records = (
-                    db.query(StockPrice)
-                    .filter(StockPrice.ticker == sym)
-                    .order_by(StockPrice.date.desc())
-                    .limit(25)
-                    .all()
-                )
-            except Exception:
-                db.rollback()
-
-            if records and len(records) >= 2:
-                latest = records[0]
-                prev = records[1]
-                latest_price = round(float(latest.close), 2)
-                prev_price = round(float(prev.close), 2)
-                dollar_change = round(latest_price - prev_price, 2)
-                pct_change = round((dollar_change / prev_price) * 100, 2) if prev_price > 0 else 0.0
-
-                # Volume anomaly calculation
-                volumes = [float(r.volume) for r in records if r.volume is not None]
-                if len(volumes) >= 5:
-                    vol_mean = sum(volumes) / len(volumes)
-                    vol_variance = sum((v - vol_mean) ** 2 for v in volumes) / len(volumes)
-                    vol_std = vol_variance ** 0.5
-                    vol_z = (float(latest.volume) - vol_mean) / (vol_std + 1e-6)
-                else:
-                    vol_z = float(latest.volume_z_score) if latest.volume_z_score is not None else 0.0
-                is_anomaly = abs(vol_z) > 2.0
-                anomaly_alert = f"🚨 Whale Spike ({vol_z:+.2f}σ)" if is_anomaly else f"Normal ({vol_z:+.2f}σ)"
-
-                # ML Trend Prediction
-                model = get_loaded_model(sym)
-                is_bullish = True
-                confidence_pct = 75.0
-                if model and len(records) >= 5:
-                    try:
-                        feature_cols = ["sma_ratio", "macd", "rsi", "daily_return", "volume_z_score"]
-                        row_dict = {
-                            "sma_ratio": float(latest.sma_ratio or 0.0),
-                            "macd": float(latest.macd or 0.0),
-                            "rsi": float(latest.rsi or 50.0),
-                            "daily_return": float(latest.daily_return or 0.0),
-                            "volume_z_score": float(vol_z)
-                        }
-                        feat_df = pd.DataFrame([row_dict])[feature_cols]
-                        pred = model.predict(feat_df)[0]
-                        probs = model.predict_proba(feat_df)[0]
-                        is_bullish = bool(pred == 1)
-                        confidence_pct = round(float(probs[pred]) * 100, 1)
-                    except Exception:
-                        pass
-                else:
-                    sma_spread = float(latest.sma_ratio) if latest.sma_ratio is not None else 0.0
-                    is_bullish = sma_spread > 0
-                    confidence_pct = 70.0
-
-                # Sentiment
-                sent_score = 0.0
-                try:
-                    sent_record = (
-                        db.query(StockNewsSentiment)
-                        .filter(StockNewsSentiment.ticker == sym)
-                        .order_by(StockNewsSentiment.date.desc())
-                        .first()
-                    )
-                    if sent_record:
-                        sent_score = float(sent_record.sentiment_score)
-                except Exception:
-                    db.rollback()
-
-                # Unified Confluence Decision
-                if is_bullish and sent_score > 0.15 and not is_anomaly:
-                    signal = "STRONG BUY"
-                elif is_bullish and sent_score < -0.15:
-                    signal = "CAUTIOUS BUY (DIVERGENCE)"
-                elif not is_bullish and sent_score < -0.15:
-                    signal = "STRONG SELL"
-                elif not is_bullish and sent_score > 0.15:
-                    signal = "CAUTIOUS SELL (DIVERGENCE)"
-                elif is_anomaly:
-                    signal = "HIGH VOLATILITY ALERT"
-                else:
-                    signal = "NEUTRAL / HOLD"
-
-                overview_list.append({
-                    "ticker": sym,
-                    "latest_price": latest_price,
-                    "dollar_change": dollar_change,
-                    "pct_change": pct_change,
-                    "confluence_signal": signal,
-                    "confidence_pct": confidence_pct,
-                    "anomaly_alert": anomaly_alert,
-                    "is_anomaly": is_anomaly,
-                    "volume_z_score": round(vol_z, 2),
-                    "as_of_date": str(latest.date)
-                })
-            else:
-                # Fallback to yfinance if database connection is unavailable
-                import yfinance as yf
-                yf_ticker = yf.Ticker(sym)
-                hist = yf_ticker.history(period="5d")
-                if not hist.empty and len(hist) >= 2:
-                    p1 = float(hist["Close"].iloc[-1])
-                    p0 = float(hist["Close"].iloc[-2])
-                    d_change = round(p1 - p0, 2)
-                    p_change = round((d_change / p0) * 100, 2)
-                    vol_series = hist["Volume"]
-                    vol_mean = float(vol_series.mean())
-                    vol_std = float(vol_series.std()) if len(vol_series) > 1 else 1.0
-                    curr_vol = float(vol_series.iloc[-1])
-                    vol_z = (curr_vol - vol_mean) / (vol_std + 1e-6)
-                    is_anomaly = abs(vol_z) > 2.0
-                    overview_list.append({
-                        "ticker": sym,
-                        "latest_price": round(p1, 2),
-                        "dollar_change": d_change,
-                        "pct_change": p_change,
-                        "confluence_signal": "STRONG BUY" if p_change > 0.5 else "CAUTIOUS BUY" if p_change > 0 else "STRONG SELL" if p_change < -0.5 else "NEUTRAL / HOLD",
-                        "confidence_pct": 82.5 if p_change > 0 else 76.0,
-                        "anomaly_alert": f"🚨 Whale Spike ({vol_z:+.2f}σ)" if is_anomaly else f"Normal ({vol_z:+.2f}σ)",
-                        "is_anomaly": is_anomaly,
-                        "volume_z_score": round(vol_z, 2),
-                        "as_of_date": str(hist.index[-1].date())
-                    })
+            overview_list.append(_overview_row(sym, db))
         except Exception as e:
-            overview_list.append({
-                "ticker": sym,
-                "latest_price": 200.00,
-                "dollar_change": 0.00,
-                "pct_change": 0.00,
-                "confluence_signal": "NEUTRAL / HOLD",
-                "confidence_pct": 70.0,
-                "anomaly_alert": "Normal (+0.00σ)",
-                "is_anomaly": False,
-                "volume_z_score": 0.0,
-                "as_of_date": "N/A"
-            })
+            print(f"[OVERVIEW ERROR] {sym}: {e}")
+            overview_list.append(_unavailable_overview_row(sym, f"Unexpected error: {e}"))
 
-    try:
-        redis_client.setex(cache_key, 60, json.dumps(overview_list))
-    except Exception:
-        pass
+    # Only cache a fully available grid, so it recovers as soon as data or models are back
+    if all(row["status"] == "OK" for row in overview_list):
+        try:
+            redis_client.setex(cache_key, 60, json.dumps(overview_list))
+        except Exception:
+            pass
 
     return overview_list
+
+
+def _price_fields(latest_close: float, prev_close: float, as_of_date: str, source: str) -> dict:
+    latest_price = round(float(latest_close), 2)
+    prev_price = round(float(prev_close), 2)
+    dollar_change = round(latest_price - prev_price, 2)
+    return {
+        "latest_price": latest_price,
+        "dollar_change": dollar_change,
+        "pct_change": round((dollar_change / prev_price) * 100, 2) if prev_price > 0 else None,
+        "as_of_date": as_of_date,
+        "price_source": source,
+    }
+
+
+def _yfinance_price_fields(sym: str) -> Optional[dict]:
+    """Real prices from Yahoo when the database has none. Prices only, never signals."""
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(sym).history(period="5d")
+    except Exception as e:
+        print(f"[OVERVIEW] yfinance price fallback failed for {sym}: {e}")
+        return None
+    if len(hist) < 2:
+        return None
+    return _price_fields(
+        hist["Close"].iloc[-1], hist["Close"].iloc[-2], str(hist.index[-1].date()), "yfinance"
+    )
+
+
+def _unavailable_overview_row(sym: str, reason: str, price_fields: Optional[dict] = None) -> dict:
+    """Overview row with no signal. Price fields are filled only if real prices are known."""
+    row = {
+        "ticker": sym,
+        "status": "UNAVAILABLE",
+        "reason": reason,
+        "latest_price": None,
+        "dollar_change": None,
+        "pct_change": None,
+        "confluence_signal": "UNAVAILABLE",
+        "confidence_pct": None,
+        "anomaly_alert": "Unavailable",
+        "is_anomaly": None,
+        "volume_z_score": None,
+        "as_of_date": None,
+        "price_source": None,
+    }
+    if price_fields:
+        row.update(price_fields)
+    return row
+
+
+def _overview_row(sym: str, db: Session) -> dict:
+    """One market-overview row: real prediction from all trained features, or UNAVAILABLE."""
+    try:
+        records = (
+            db.query(StockPrice)
+            .filter(StockPrice.ticker == sym)
+            .order_by(StockPrice.date.desc())
+            .limit(2)
+            .all()
+        )
+    except Exception as e:
+        db.rollback()
+        print(f"[OVERVIEW] Database query failed for {sym}: {e}")
+        records = []
+
+    if len(records) < 2:
+        return _unavailable_overview_row(
+            sym, "No price history in database", _yfinance_price_fields(sym)
+        )
+
+    latest, prev = records
+    price = _price_fields(latest.close, prev.close, str(latest.date), "database")
+
+    model = get_loaded_model(sym)
+    if model is None:
+        return _unavailable_overview_row(sym, f"No trained model for {sym}", price)
+
+    features, missing = build_feature_frame(latest, model)
+    if features is None:
+        return _unavailable_overview_row(
+            sym, f"Insufficient historical data: missing features {missing}", price
+        )
+
+    try:
+        is_bullish, confidence_pct = predict_trend(model, features)
+    except Exception as e:
+        print(f"[OVERVIEW] Model inference failed for {sym}: {e}")
+        return _unavailable_overview_row(sym, f"Model inference failed: {e}", price)
+
+    # Same stored feature the model was trained on, and the same threshold as other endpoints
+    vol_z = float(latest.volume_z_score)
+    is_anomaly = vol_z > ANOMALY_Z_THRESHOLD
+
+    sent_score = 0.0
+    try:
+        sent_record = (
+            db.query(StockNewsSentiment)
+            .filter(StockNewsSentiment.ticker == sym)
+            .order_by(StockNewsSentiment.date.desc())
+            .first()
+        )
+        if sent_record:
+            sent_score = float(sent_record.sentiment_score)
+    except Exception:
+        db.rollback()
+
+    signal, _ = confluence_decision(is_bullish, sent_score, is_anomaly, vol_z)
+
+    return {
+        "ticker": sym,
+        "status": "OK",
+        "reason": None,
+        **price,
+        "confluence_signal": signal,
+        "confidence_pct": confidence_pct,
+        "anomaly_alert": f"🚨 Whale Spike ({vol_z:+.2f}σ)" if is_anomaly else f"Normal ({vol_z:+.2f}σ)",
+        "is_anomaly": is_anomaly,
+        "volume_z_score": round(vol_z, 2),
+    }
 
 
 # =====================================================================
