@@ -6,6 +6,10 @@ import plotly.graph_objects as go
 from pathlib import Path
 import json
 import sys
+import os
+
+API_KEY = os.getenv("STREAMQUANT_API_KEY", "streamquant-dev-secret")
+API_HEADERS = {"X-API-KEY": API_KEY}
 
 # Ensure project root is in sys.path for direct model/sentiment fallback access
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -852,7 +856,7 @@ with tab_execution:
                 "confidence_pct": confidence
             }
             try:
-                res = requests.post("http://127.0.0.1:8000/execute-trade", json=order_payload, timeout=5)
+                res = requests.post("http://127.0.0.1:8000/execute-trade", json=order_payload, headers=API_HEADERS, timeout=5)
                 if res.status_code == 200:
                     st.success(f"Order executed successfully! Details: {res.json()}")
                 else:
@@ -862,7 +866,7 @@ with tab_execution:
 
     with trade_col2:
         try:
-            port_res = requests.get("http://127.0.0.1:8000/portfolio-summary", timeout=2)
+            port_res = requests.get("http://127.0.0.1:8000/portfolio-summary", headers=API_HEADERS, timeout=2)
             if port_res.status_code == 200:
                 pdata = port_res.json()
                 st.metric("Paper Portfolio Equity", f"${pdata.get('equity', 100000):,.2f}")

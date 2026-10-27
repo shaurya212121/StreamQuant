@@ -20,6 +20,9 @@ yfinance>=0.2.36
 pandas>=2.1.0
 numpy>=1.26.0
 
+# Broker & Trade Execution Gateway
+alpaca-py>=0.20.0
+
 # Machine Learning & Explainable AI
 xgboost>=2.0.0
 scikit-learn>=1.3.0
@@ -33,5 +36,3 @@ plotly>=5.18.0
 
 # Load Testing & Benchmarking
 locust>=2.23.0
-
-alpaca-py>=0.20.0

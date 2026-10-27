@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Query, Request
+from fastapi import FastAPI, Depends, HTTPException, Query, Request, Header
 from typing import Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
@@ -33,7 +33,7 @@ RATE_LIMIT_WINDOW_SECONDS = 60  # Time window (1 minute)
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     # Protect API and trading endpoints from broker rate-limit exhaustion
-    exempt_paths = {"/docs", "/redoc", "/openapi.json"}
+    exempt_paths = { "/","/docs", "/redoc", "/openapi.json"}
     if request.url.path not in exempt_paths:
         client_ip = request.client.host if request.client else "unknown"
         rate_key = f"rate_limit:{client_ip}"
@@ -482,7 +482,16 @@ class TradeRequest(BaseModel):
     def validate_signal(cls, v: str) -> str:
         return v.strip().upper()
 
-@app.get("/portfolio-summary")
+API_KEY = os.getenv("STREAMQUANT_API_KEY", "streamquant-dev-secret")
+
+def verify_api_key(x_api_key: Optional[str] = Header(None)):
+    if x_api_key != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Missing or invalid X-API-KEY header."
+        )
+
+@app.get("/portfolio-summary", dependencies=[Depends(verify_api_key)])
 def get_portfolio_summary():
     """
     Exposes paper account metrics (cash balance, total equity, buying power) 
@@ -490,14 +499,14 @@ def get_portfolio_summary():
     """
     return alpaca_executor.get_account_portfolio()
 
-@app.get("/recent-orders")
+@app.get("/recent-orders", dependencies=[Depends(verify_api_key)])
 def get_recent_orders():
     """
     Exposes recent filled and active order logs for compliance audit trails.
     """
     return alpaca_executor.get_recent_orders()
 
-@app.post("/execute-trade")
+@app.post("/execute-trade", dependencies=[Depends(verify_api_key)])
 def execute_trade(request: TradeRequest):
     """
     Receives trade triggers from the UI, validates them through Pydantic,
