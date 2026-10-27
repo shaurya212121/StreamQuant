@@ -96,6 +96,11 @@ def _run_pipeline(monkeypatch, last_stored):
     raw = _fake_yahoo_history(n_days=120, rally_days=5)
     monkeypatch.setattr(data_engine.yf, "download", lambda *a, **k: raw.copy())
     monkeypatch.setattr(data_engine, "get_last_stored_date", lambda ticker: last_stored)
+    # Stored closes match Yahoo exactly, so no split is detected in these tests
+    fresh_closes = pd.Series(raw["Close"].to_numpy(), index=raw.index.rename(None))
+    monkeypatch.setattr(
+        data_engine, "get_stored_closes", lambda ticker, since: fresh_closes[fresh_closes.index >= pd.Timestamp(since)]
+    )
 
     stored = {}
 
@@ -189,6 +194,106 @@ def test_manual_pipeline_reports_failure_and_continues(monkeypatch):
 
     assert "BAD" in result["failed"]
     assert result["succeeded"]["GOOD"].startswith("ok:")
+
+
+# --- 3.6: detect re-adjusted history (splits) and re-sync ---------------------
+
+def _closes(dates, values):
+    return pd.Series(values, index=pd.DatetimeIndex(dates), dtype=float)
+
+
+def test_no_basis_change_when_closes_match():
+    dates = pd.date_range("2026-01-05", periods=5, freq="B")
+    fresh = pd.DataFrame({"date": dates, "close": [100.0, 101.0, 102.0, 103.0, 104.0]})
+    assert data_engine.find_price_basis_change(fresh, _closes(dates, fresh["close"].to_numpy())) is None
+
+
+def test_missing_closes_are_ignored():
+    dates = pd.date_range("2026-01-05", periods=3, freq="B")
+    fresh = pd.DataFrame({"date": dates, "close": [100.0, np.nan, 102.0]})
+    assert data_engine.find_price_basis_change(fresh, _closes(dates, [100.0, 101.0, 102.0])) is None
+
+
+def test_small_revision_below_tolerance_is_ignored():
+    """A 0.3% difference (small dividend adjustment or a late revision) is not a split."""
+    dates = pd.date_range("2026-01-05", periods=5, freq="B")
+    fresh = pd.DataFrame({"date": dates, "close": [100.0] * 5})
+    assert data_engine.find_price_basis_change(fresh, _closes(dates, [100.3] * 5)) is None
+
+
+def test_ten_for_one_split_is_detected():
+    dates = pd.date_range("2026-01-05", periods=5, freq="B")
+    fresh = pd.DataFrame({"date": dates, "close": [100.0, 101.0, 102.0, 103.0, 104.0]})
+    stored = _closes(dates, [1000.0, 1010.0, 1020.0, 1030.0, 1040.0])  # pre-split prices
+
+    change = data_engine.find_price_basis_change(fresh, stored)
+
+    assert change is not None
+    assert np.isclose(change["change"], 0.9)
+    assert change["stored"] == 1000.0 and change["fresh"] == 100.0
+
+
+def test_no_overlapping_dates_means_no_basis_change():
+    fresh = pd.DataFrame({"date": pd.date_range("2026-02-02", periods=3, freq="B"), "close": [1.0, 2.0, 3.0]})
+    stored = _closes(pd.date_range("2026-01-05", periods=3, freq="B"), [10.0, 20.0, 30.0])
+    assert data_engine.find_price_basis_change(fresh, stored) is None
+
+
+def _run_with_split(monkeypatch, split_factor):
+    """Yahoo history is post-split adjusted; the DB still holds closes `split_factor` times higher."""
+    raw = _fake_yahoo_history(n_days=120, rally_days=5)
+    periods = []
+
+    def fake_download(ticker, period=None, **k):
+        periods.append(period)
+        return raw.copy()
+
+    first_stored = raw.index[60].date()
+    last_stored = raw.index[-4].date()
+    stored_closes = pd.Series(raw["Close"].to_numpy() * split_factor, index=raw.index.rename(None))
+
+    monkeypatch.setattr(data_engine.yf, "download", fake_download)
+    monkeypatch.setattr(data_engine, "get_last_stored_date", lambda ticker: last_stored)
+    monkeypatch.setattr(data_engine, "get_first_stored_date", lambda ticker: first_stored)
+    monkeypatch.setattr(
+        data_engine, "get_stored_closes", lambda ticker, since: stored_closes[stored_closes.index >= pd.Timestamp(since)]
+    )
+
+    writes = []
+    monkeypatch.setattr(
+        data_engine, "store_data_in_db", lambda df, ticker, update_on_conflict=False: writes.append(df.copy())
+    )
+
+    result = data_engine.ingest_ticker("NVDA")
+    return result, writes, periods, raw, first_stored
+
+
+def test_split_triggers_full_history_resync(monkeypatch):
+    result, writes, periods, raw, first_stored = _run_with_split(monkeypatch, split_factor=10.0)
+
+    assert "max" in periods  # full history was fetched, not just 2y
+    assert len(writes) == 1  # only the re-sync write; the normal incremental write is skipped
+    rewritten = writes[0]
+    assert rewritten["date"].iloc[0] == pd.Timestamp(first_stored)  # every stored row is rewritten
+    assert rewritten["date"].iloc[-1] == raw.index[-1]  # including the new bars
+    assert result.startswith("re-synced")
+
+
+def test_resynced_history_has_no_step(monkeypatch):
+    """After re-sync the stored series is continuous: no 10x jump between neighbouring bars."""
+    _, writes, _, _, _ = _run_with_split(monkeypatch, split_factor=10.0)
+
+    daily_moves = writes[0]["close"].pct_change().dropna().abs()
+    assert daily_moves.max() < 0.5
+
+
+def test_unchanged_history_does_not_resync(monkeypatch):
+    result, writes, periods, _, _ = _run_with_split(monkeypatch, split_factor=1.0)
+
+    assert "max" not in periods
+    assert len(writes) == 1
+    assert len(writes[0]) == 3 + data_engine.OVERLAP_BARS
+    assert result.startswith("ok: 3 new bar(s)")
 
 
 # --- 3.2: ingestion uses the shared volume z-score ----------------------------

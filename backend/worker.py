@@ -14,6 +14,20 @@ load_dotenv(dotenv_path=ENV_PATH)
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 
+
+def redis_ssl_settings(url: str) -> dict:
+    """Celery TLS settings for the given Redis URL.
+
+    TLS is enabled only for rediss:// URLs (e.g. Upstash), with certificate
+    verification on. Plain redis:// (local Docker Redis) gets no TLS settings,
+    because Celery refuses to start when SSL options are paired with redis://.
+    """
+    if not url.startswith("rediss://"):
+        return {}
+    tls = {"ssl_cert_reqs": ssl.CERT_REQUIRED}
+    return {"broker_use_ssl": tls, "redis_backend_use_ssl": tls}
+
+
 celery_app = Celery(
     "streamquant_worker",
     broker=REDIS_URL,
@@ -21,8 +35,7 @@ celery_app = Celery(
 )
 
 celery_app.conf.update(
-    broker_use_ssl={'ssl_cert_reqs': ssl.CERT_NONE},
-    redis_backend_use_ssl={'ssl_cert_reqs': ssl.CERT_NONE},
+    **redis_ssl_settings(REDIS_URL),
     # Daily market-close ingestion (US equities close 4:00 PM New York time, DST-aware)
     timezone="America/New_York",
     enable_utc=True,

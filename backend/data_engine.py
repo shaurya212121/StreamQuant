@@ -261,6 +261,11 @@ TICKERS = ["AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "TSLA"]
 # Recent bars re-upserted on every run so late revisions from Yahoo are picked up
 OVERLAP_BARS = 5
 
+# Yahoo returns split/dividend-adjusted prices and re-adjusts all past bars after a
+# corporate action. If a stored close differs from Yahoo's current close for the same
+# day by more than this, stored history is in an old price basis and must be re-synced.
+RESYNC_TOLERANCE = 0.005
+
 
 def get_last_stored_date(ticker: str) -> datetime.date | None:
     """Most recent bar date stored for `ticker`, or None if it has no rows yet."""
@@ -271,6 +276,62 @@ def get_last_stored_date(ticker: str) -> datetime.date | None:
         ).scalar()
     finally:
         session.close()
+
+
+def get_first_stored_date(ticker: str) -> datetime.date | None:
+    """Oldest bar date stored for `ticker`, or None if it has no rows yet."""
+    session = SessionLocal()
+    try:
+        return session.execute(
+            select(func.min(StockPrice.date)).where(StockPrice.ticker == ticker)
+        ).scalar()
+    finally:
+        session.close()
+
+
+def get_stored_closes(ticker: str, since: datetime.date) -> pd.Series:
+    """Stored closing prices for `ticker` from `since` onwards, indexed by date."""
+    session = SessionLocal()
+    try:
+        rows = session.execute(
+            select(StockPrice.date, StockPrice.close)
+            .where(StockPrice.ticker == ticker, StockPrice.date >= since)
+            .order_by(StockPrice.date)
+        ).all()
+    finally:
+        session.close()
+    return pd.Series(
+        [close for _, close in rows],
+        index=pd.to_datetime([d for d, _ in rows]),
+        dtype=float,
+    )
+
+
+def find_price_basis_change(
+    fresh: pd.DataFrame, stored_closes: pd.Series, tolerance: float = RESYNC_TOLERANCE
+) -> dict | None:
+    """Compare fresh Yahoo closes with stored closes on the dates both have.
+
+    Returns the worst mismatch if it exceeds `tolerance` (e.g. every past bar
+    divided by 10 after NVDA's 10:1 split), otherwise None.
+    """
+    fresh_closes = fresh.set_index("date")["close"]
+    common = stored_closes.index.intersection(fresh_closes.index)
+    if common.empty:
+        return None
+
+    change = ((fresh_closes[common] - stored_closes[common]).abs() / stored_closes[common]).dropna()
+    if change.empty:
+        return None
+    worst = change.idxmax()
+    if change[worst] <= tolerance:
+        return None
+    return {
+        "date": worst,
+        "stored": float(stored_closes[worst]),
+        "fresh": float(fresh_closes[worst]),
+        "change": float(change[worst]),
+    }
 
 
 def select_rows_to_store(
@@ -309,12 +370,35 @@ TRANSIENT_ERRORS: tuple[type[BaseException], ...] = (
 )
 
 
+def resync_full_history(symbol: str) -> int:
+    """Rewrite every stored bar for `symbol` in Yahoo's current price basis.
+
+    Uses the full ("max") history rather than 2y, so rows older than the normal
+    fetch window are re-adjusted too and the stored series has no step in it.
+    Returns the number of bars written.
+    """
+    full = fetch_and_prepare_data(symbol, period="max")
+    if full.empty:
+        raise DataFetchError(f"Yahoo Finance returned no full history for {symbol} during re-sync.")
+
+    first_stored = get_first_stored_date(symbol)
+    if first_stored is not None:
+        full = full[full["date"] >= pd.Timestamp(first_stored)]
+
+    store_data_in_db(full, ticker=symbol, update_on_conflict=True)
+    return len(full)
+
+
 def ingest_ticker(symbol: str, overlap_bars: int = OVERLAP_BARS) -> str:
     """Fetch, enrich and store every bar missing for one ticker. Raises on failure.
 
     A worker outage of N days is backfilled on the next run instead of leaving
     permanent gaps. Features are computed on the full 2y history so rolling
     windows are correct, but only the missing (and overlap) bars are written.
+
+    Before writing, the overlap bars are compared with what is stored. If Yahoo
+    has re-adjusted history (split or large dividend), the whole stored history
+    is re-synced instead, so charts and features have no sudden step.
     """
     print(f"\n--- Daily job: {symbol} ---")
     df = fetch_and_prepare_data(symbol, period="2y")
@@ -333,6 +417,22 @@ def ingest_ticker(symbol: str, overlap_bars: int = OVERLAP_BARS) -> str:
 
     to_store = select_rows_to_store(df, last_stored, overlap_bars)
     new_bars = to_store if last_stored is None else to_store[to_store["date"] > pd.Timestamp(last_stored)]
+
+    if last_stored is not None and not to_store.empty:
+        stored_closes = get_stored_closes(symbol, since=to_store["date"].iloc[0].date())
+        change = find_price_basis_change(to_store, stored_closes)
+        if change is not None:
+            logger.warning(
+                "%s: stored close on %s was %.4f but Yahoo now reports %.4f (%.1f%% change); "
+                "history was re-adjusted (split or dividend). Re-syncing full history.",
+                symbol, str(change["date"])[:10], change["stored"], change["fresh"], change["change"] * 100,
+            )
+            written = resync_full_history(symbol)
+            return (
+                f"re-synced {written} bar(s): close on {str(change['date'])[:10]} changed "
+                f"{change['stored']:.2f} -> {change['fresh']:.2f} ({change['change']:.1%}), "
+                f"likely a split or dividend"
+            )
 
     store_data_in_db(to_store, ticker=symbol, update_on_conflict=True)
 
