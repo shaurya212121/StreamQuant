@@ -1,0 +1,11 @@
+{
+    "ticker": "NVDA",
+    "test_period": "2026-03-26 to 2026-10-08",
+    "total_test_days": 136,
+    "strategy_return_pct": 4.33,
+    "benchmark_buy_and_hold_pct": 34.9,
+    "win_rate_pct": 53.49,
+    "sharpe_ratio": 0.5,
+    "max_drawdown_pct": -11.73,
+    "total_trades_executed": 49
+}

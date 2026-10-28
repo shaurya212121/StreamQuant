@@ -1,0 +1,11 @@
+{
+    "ticker": "TSLA",
+    "test_period": "2026-03-26 to 2026-10-08",
+    "total_test_days": 136,
+    "strategy_return_pct": 13.32,
+    "benchmark_buy_and_hold_pct": 0.78,
+    "win_rate_pct": 51.61,
+    "sharpe_ratio": 0.79,
+    "max_drawdown_pct": -18.22,
+    "total_trades_executed": 38
+}
