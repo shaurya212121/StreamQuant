@@ -411,7 +411,7 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
     else:
         is_anomaly = bool(vol_z > ANOMALY_Z_THRESHOLD)
         anomaly_alert = (
-            f"WHALE TRADE DETECTED: Volume is +{vol_z:.2f}σ above 20-day mean"
+            f"VOLUME ANOMALY DETECTED: Volume is +{vol_z:.2f}σ above 20-day mean"
             if is_anomaly else "Normal institutional liquidity"
         )
 
@@ -758,7 +758,7 @@ def _overview_row(sym: str, db: Session) -> dict:
         **price,
         "confluence_signal": signal,
         "confidence_pct": confidence_pct,
-        "anomaly_alert": f"🚨 Whale Spike ({vol_z:+.2f}σ)" if is_anomaly else f"Normal ({vol_z:+.2f}σ)",
+        "anomaly_alert": f"🚨 Volume Spike ({vol_z:+.2f}σ)" if is_anomaly else f"Normal ({vol_z:+.2f}σ)",
         "is_anomaly": is_anomaly,
         "volume_z_score": round(vol_z, 2),
     }

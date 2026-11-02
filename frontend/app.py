@@ -236,7 +236,7 @@ def fetch_market_overview():
                     "pct_change": pct,
                     "confluence_signal": sig,
                     "confidence_pct": conf,
-                    "anomaly_alert": f"🚨 Whale Spike ({z:+.2f}σ)" if is_anom else f"Normal ({z:+.2f}σ)",
+                    "anomaly_alert": f"🚨 Volume Spike ({z:+.2f}σ)" if is_anom else f"Normal ({z:+.2f}σ)",
                     "is_anomaly": is_anom,
                     "volume_z_score": round(float(z), 2)
                 })
@@ -391,7 +391,7 @@ st.markdown("""
                     ⚡ StreamQuant Multi-Asset Terminal
                 </h1>
                 <p style="margin: 4px 0 0 0; font-size: 13px; color: #94a3b8;">
-                    Unified Confluence Matrix • Statistical Whale Detection • Strict Out-of-Sample Backtesting
+                    Unified Confluence Matrix • Statistical Volume Anomaly Detection • Strict Out-of-Sample Backtesting
                 </p>
             </div>
             <div style="display: flex; gap: 12px; margin-top: 8px;">
@@ -545,7 +545,7 @@ st.markdown(f"""
         <h2 style="margin: 0; font-size: 22px; font-weight: 800; color: #f8fafc;">
             📊 Deep-Dive Intelligence: <span style="color: #38bdf8;">{active_sym}</span>
         </h2>
-        <span style="color: #94a3b8; font-size: 13px;">Analyzing Technicals, Whale Volume & FinBERT Sentiment</span>
+        <span style="color: #94a3b8; font-size: 13px;">Analyzing Technicals, Institutional Volume & FinBERT Sentiment</span>
     </div>
 """, unsafe_allow_html=True)
 
@@ -641,7 +641,7 @@ with sig_col2:
         st.markdown(f"""
             <div style="background: linear-gradient(135deg, #78350f, #b45309); border-radius: 10px; padding: 18px; border-left: 5px solid #f59e0b;">
                 <p style="color: #fde68a; font-size: 11px; margin: 0; font-weight: 700; letter-spacing: 1px;">🐋 INSTITUTIONAL FLOW</p>
-                <p style="color: #ffffff; font-size: 24px; font-weight: 800; margin: 4px 0;">🚨 WHALE ANOMALY</p>
+                <p style="color: #ffffff; font-size: 24px; font-weight: 800; margin: 4px 0;">🚨 VOLUME SPIKE</p>
                 <p style="color: #fef3c7; font-size: 13px; margin: 0;">Volume Z-Score: <b>{z_score:.2f}σ</b></p>
             </div>
         """, unsafe_allow_html=True)
@@ -701,7 +701,7 @@ k1.metric("Current Price", f"${latest['close']:,.2f}", f"{price_change:+.2f} ({p
 sma_spread = float(latest.get('sma_ratio', 0.0))
 k2.metric("SMA Momentum", f"{sma_spread:.2%}", "Bullish Spread" if sma_spread > 0 else "Bearish Drag")
 k3.metric("Daily Volume", f"{int(latest['volume']):,}")
-k4.metric("Volume Z-Score", f"{z_score:.2f}σ", "🚨 WHALE SPIKE" if is_anomaly else "Normal", delta_color="inverse" if is_anomaly else "normal")
+k4.metric("Volume Z-Score", f"{z_score:.2f}σ", "🚨 VOLUME SPIKE" if is_anomaly else "Normal", delta_color="inverse" if is_anomaly else "normal")
 
 # Interactive Price Action Chart (Plotly)
 st.markdown("#### 📈 Price Action History")
