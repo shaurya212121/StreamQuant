@@ -154,7 +154,7 @@ def fetch_and_prepare_data(ticker: str, period: str = "2y") -> pd.DataFrame:
     df = add_advanced_features(df)
 
     # 5. Normalize timestamps: convert to UTC then strip timezone for naive storage
-    if pd.api.types.is_datetime64tz_dtype(df["date"]):
+    if isinstance(df["date"].dtype, pd.DatetimeTZDtype):
         df["date"] = df["date"].dt.tz_convert("UTC").dt.tz_localize(None)
 
     # 6. Lowercase all column headers to match PostgreSQL table schema

@@ -38,10 +38,14 @@ def pull_stock_history(ticker_symbol: str) -> pd.DataFrame:
 def prepare_data(df: pd.DataFrame):
     """Engineers the binary target and isolates the 8 institutional features."""
     df['tomorrow_close'] = df['close'].shift(-1)
-    df['price_went_up'] = (df['tomorrow_close'] > df['close']).astype(int)
+    # The last bar has no "tomorrow"; leave its label NaN so it is dropped, instead of
+    # (NaN > close) silently becoming 0 = "price went down"
+    df['price_went_up'] = (df['tomorrow_close'] > df['close']).astype(float)
+    df.loc[df['tomorrow_close'].isna(), 'price_went_up'] = np.nan
 
     # Drop NaNs across required features and target
-    clean_df = df.dropna(subset=['price_went_up'] + FEATURE_COLS)
+    clean_df = df.dropna(subset=['price_went_up'] + FEATURE_COLS).copy()
+    clean_df['price_went_up'] = clean_df['price_went_up'].astype(int)
     
     X = clean_df[FEATURE_COLS]
     y = clean_df['price_went_up']
@@ -98,12 +102,14 @@ def train_model(ticker_symbol: str):
 
     print(f"[{ticker_symbol}] OOF Metrics -> Accuracy: {mean_acc:.4f} | Precision: {mean_prec:.4f} | F1: {mean_f1:.4f}")
 
-    # 4. Final Refit on 100% of historical data using average optimal estimators
+    # 4. Final Refit on historical data using cross-validated optimal estimators
     avg_best_iter = int(np.mean(best_iterations)) if best_iterations else 50
-    print(f"[{ticker_symbol}] Refitting final model on 100% dataset (n_estimators={max(avg_best_iter, 10)})...")
+    # Audit H6 fix: enforce minimum 50 trees instead of 10 to ensure meaningful ensemble capacity
+    chosen_estimators = max(avg_best_iter, 50)
+    print(f"[{ticker_symbol}] Refitting final model (n_estimators={chosen_estimators})...")
 
     final_model = xgb.XGBClassifier(
-        n_estimators=max(avg_best_iter, 10),
+        n_estimators=chosen_estimators,
         learning_rate=0.03,
         max_depth=4,
         subsample=0.8,

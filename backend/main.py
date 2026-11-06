@@ -11,11 +11,13 @@ from celery.result import AsyncResult
 import redis
 import json
 import math
+import secrets
+from datetime import datetime, timezone
 from fastapi.responses import JSONResponse
 sys.path.append(str(Path(__file__).resolve().parent.parent))
 from db.database import SessionLocal
-from db.models import StockPrice, StockNewsSentiment 
-from backend.worker import celery_app, run_batch_sentiment
+from db.models import StockPrice, StockNewsSentiment, OrderAudit
+from backend.worker import celery_app, run_batch_sentiment, refresh_news_headlines_task
 from pydantic import BaseModel, Field, field_validator
 from backend.execution import alpaca_executor
 import os
@@ -27,35 +29,40 @@ load_dotenv(dotenv_path=ENV_PATH)
 
 app = FastAPI(title="StreamQuant API", version="1.0")
 
-# --- DISTRIBUTED RATE LIMITER (Redis Sliding Window) ---
+# Canonical source of truth for supported model tickers across the platform
+SUPPORTED_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
+
+# --- DISTRIBUTED RATE LIMITER (Atomic Redis Fixed Window Counter) ---
 RATE_LIMIT_MAX_REQUESTS = 30  # Max requests allowed
 RATE_LIMIT_WINDOW_SECONDS = 60  # Time window (1 minute)
 
 @app.middleware("http")
 async def rate_limit_middleware(request: Request, call_next):
     # Protect API and trading endpoints from broker rate-limit exhaustion
-    exempt_paths = { "/","/docs", "/redoc", "/openapi.json"}
+    exempt_paths = {"/", "/docs", "/redoc", "/openapi.json"}
     if request.url.path not in exempt_paths:
         client_ip = request.client.host if request.client else "unknown"
         rate_key = f"rate_limit:{client_ip}"
 
         try:
-            # Atomic increment in Redis
-            requests_count = redis_client.incr(rate_key)
-            if requests_count == 1:
-                # Set 60-second expiration on the first request
+            # Atomic pipeline increment and TTL inspection
+            pipe = redis_client.pipeline()
+            pipe.incr(rate_key)
+            pipe.ttl(rate_key)
+            requests_count, ttl = pipe.execute()
+            if ttl == -1:
                 redis_client.expire(rate_key, RATE_LIMIT_WINDOW_SECONDS)
+                ttl = RATE_LIMIT_WINDOW_SECONDS
 
             if requests_count > RATE_LIMIT_MAX_REQUESTS:
-                ttl = redis_client.ttl(rate_key)
                 return JSONResponse(
                     status_code=429,
                     content={
                         "error": "Too Many Requests",
-                        "message": f"Rate limit exceeded (30 req/min). Try again in {ttl} seconds."
+                        "message": f"Rate limit exceeded (30 req/min). Try again in {max(1, ttl)} seconds."
                     }
                 )
-        except Exception as e:
+        except Exception:
             # Fail-open: If Redis is down, don't block legitimate user traffic
             pass
 
@@ -89,6 +96,21 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def verify_api_key(x_api_key: Optional[str] = Header(None)):
+    """Constant-time API key verification preventing timing attacks and public defaults."""
+    expected_key = os.getenv("STREAMQUANT_API_KEY", "").strip()
+    if not expected_key:
+        raise HTTPException(
+            status_code=500,
+            detail="Server security configuration error: STREAMQUANT_API_KEY is not configured."
+        )
+    if not x_api_key or not secrets.compare_digest(x_api_key, expected_key):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Missing or invalid X-API-KEY header."
+        )
 
 
 # Volume spikes beyond this many standard deviations are flagged as anomalies (all endpoints)
@@ -127,10 +149,34 @@ def predict_trend(model, features: pd.DataFrame) -> tuple[bool, float]:
     return pred == 1, round(float(probabilities[pred] * 100), 2)
 
 
-def confluence_decision(is_bullish: bool, news_score: float, is_anomaly: bool, vol_z: Optional[float]) -> tuple[str, str]:
-    """Combine ML trend, news sentiment and volume anomaly into one (signal, summary)."""
+def confluence_decision(
+    is_bullish: bool,
+    news_score: float,
+    is_anomaly: bool,
+    vol_z: Optional[float],
+    confidence_pct: Optional[float] = None,
+    sentiment_method: str = "finbert",
+    is_sentiment_stale: bool = False
+) -> tuple[str, str]:
+    """
+    Combine ML trend, news sentiment, statistical volume anomaly, and confidence into one (signal, summary).
+    - C4 Guard: Keyword lexicon fallback scores are not permitted to trigger STRONG BUY.
+    - M3 Guard: Model confidence below 65% caps the signal to CAUTIOUS BUY.
+    - Freshness Guard: Sentiment older than 3 days suppresses STRONG BUY to CAUTIOUS BUY (STALE SENTIMENT).
+    """
+    min_confidence = 65.0
+    has_high_confidence = confidence_pct is None or confidence_pct >= min_confidence
+    is_verified_finbert = (sentiment_method == "finbert")
+
     if is_bullish and news_score > 0.15 and not is_anomaly:
-        return "STRONG BUY", "Technical trend is Bullish with supportive news sentiment and stable liquidity."
+        if not is_verified_finbert:
+            return "CAUTIOUS BUY", "Technical trend is Bullish, but sentiment is unverified (lexicon fallback). Strong buy suppressed."
+        if is_sentiment_stale:
+            return "CAUTIOUS BUY (STALE SENTIMENT)", "Technical trend is Bullish, but news sentiment is older than 3 days. Strong buy suppressed."
+        if not has_high_confidence:
+            return "CAUTIOUS BUY", f"Technical trend is Bullish, but model confidence ({confidence_pct:.1f}%) is below 65% threshold."
+        return "STRONG BUY", "Technical trend is Bullish with supportive FinBERT sentiment and stable liquidity."
+
     if is_bullish and news_score < -0.15:
         return "CAUTIOUS BUY (DIVERGENCE)", "Model predicts upward trend, but news sentiment is Negative. Watch for headline risk."
     if not is_bullish and news_score < -0.15:
@@ -138,7 +184,8 @@ def confluence_decision(is_bullish: bool, news_score: float, is_anomaly: bool, v
     if not is_bullish and news_score > 0.15:
         return "CAUTIOUS SELL (DIVERGENCE)", "Technical trend is Bearish despite positive news sentiment."
     if is_anomaly:
-        return "HIGH VOLATILITY ALERT", f"Volume spike detected ({vol_z:.2f}σ). Institutional block trades in progress."
+        z_str = f"{vol_z:.2f}σ" if vol_z is not None else "threshold"
+        return "HIGH VOLATILITY ALERT", f"Statistically abnormal volume spike detected ({z_str})."
     return "NEUTRAL / HOLD", "Mixed or balanced indicators across technical and sentiment layers."
 
 @app.get("/")
@@ -218,12 +265,18 @@ def get_stock_sentiment(ticker: str, db: Session = Depends(get_db)):
         "cached_db_result": True
     }
 
-@app.post("/api/sentiment/{ticker}/refresh")
+@app.post("/api/sentiment/{ticker}/refresh", dependencies=[Depends(verify_api_key)])
 def refresh_stock_sentiment(ticker: str):
     """Manually push a symbol to the Celery queue for an out-of-cycle ML sentiment update."""
-    task = run_batch_sentiment.delay(ticker.upper())
+    clean = ticker.strip().upper()
+    if clean not in SUPPORTED_TICKERS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported ticker '{ticker}'. Supported: {', '.join(SUPPORTED_TICKERS)}"
+        )
+    task = run_batch_sentiment.delay(clean)
     return {
-        "message": f"Background sentiment analysis triggered for {ticker.upper()}.",
+        "message": f"Background sentiment analysis triggered for {clean}.",
         "task_id": task.id
     }
 
@@ -312,7 +365,7 @@ def get_stock_prediction(ticker: str, db: Session = Depends(get_db)):
 
     return result
 
-@app.get("/api/tasks/{task_id}")
+@app.get("/api/tasks/{task_id}", dependencies=[Depends(verify_api_key)])
 def get_task_status(task_id: str):
     """
     Check the live status and result of any background Celery ML task.
@@ -334,24 +387,27 @@ def get_task_status(task_id: str):
 # =====================================================================
 # UNIFIED INTELLIGENCE GATEWAY (Aggregated AI + Quant + Sentiment)
 # =====================================================================
-@app.get("/api/stocks/{ticker}/intelligence")
-def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
+# =====================================================================
+# UNIFIED INTELLIGENCE GATEWAY (Aggregated AI + Quant + Sentiment)
+# =====================================================================
+def compute_unified_intelligence_data(ticker: str, db: Session, use_cache: bool = True) -> dict:
     """
-    Unified Intelligence Gateway:
     Consolidates XGBoost trend prediction, SHAP feature drivers, Volume Z-Score 
-    anomaly alerts, and FinBERT news sentiment into a single Redis-cached response.
+    anomaly alerts, and FinBERT news sentiment into a single unified payload.
+    Used by both the GET /intelligence API route and POST /execute-trade validation.
     """
     ticker = ticker.upper()
     cache_key = f"intelligence:{ticker}"
 
     # 1. Check Upstash Redis Cache First (< 10ms response)
-    try:
-        cached_data = redis_client.get(cache_key)
-        if cached_data:
-            print(f"[CACHE HIT] Returning unified intelligence for {ticker} from Redis!")
-            return json.loads(cached_data)
-    except Exception as e:
-        print(f"[CACHE WARNING] Redis lookup failed: {e}")
+    if use_cache:
+        try:
+            cached_data = redis_client.get(cache_key)
+            if cached_data:
+                print(f"[CACHE HIT] Returning unified intelligence for {ticker} from Redis!")
+                return json.loads(cached_data)
+        except Exception as e:
+            print(f"[CACHE WARNING] Redis lookup failed: {e}")
 
     # 2. Query Latest Price & Technical Features from PostgreSQL
     latest_price = (
@@ -371,7 +427,7 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
     if not model:
         raise HTTPException(
             status_code=404,
-            detail=f"No trained XGBoost model found for '{ticker}'. Available: AAPL, AMZN, GOOGL, MSFT, NVDA, TSLA."
+            detail=f"No trained XGBoost model found for '{ticker}'. Available: {', '.join(SUPPORTED_TICKERS)}."
         )
 
     # 4. Build the feature vector exactly as the model was trained (strict: no defaults)
@@ -380,6 +436,8 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
 
     # 5-6. XGBoost inference and SHAP top-3 drivers (only on real features)
     top_drivers = []
+    confidence_pct = None
+    is_bullish = False
     if ml_available:
         is_bullish, confidence_pct = predict_trend(model, features_df)
         try:
@@ -415,20 +473,32 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
             if is_anomaly else "Normal institutional liquidity"
         )
 
-    # 8. Query Pre-Computed FinBERT News Sentiment
+    # 8. Query Pre-Computed FinBERT News Sentiment with Provenance and Freshness
     sentiment_record = (
         db.query(StockNewsSentiment)
         .filter(StockNewsSentiment.ticker == ticker)
         .order_by(StockNewsSentiment.date.desc())
         .first()
     )
+    is_sentiment_stale = False
     if sentiment_record:
+        sent_method = getattr(sentiment_record, "method", "finbert")
+        sent_date = sentiment_record.date
+        sent_date_val = sent_date.date() if hasattr(sent_date, "date") else sent_date
+        current_date_val = datetime.now(timezone.utc).date()
+        sent_age_days = (current_date_val - sent_date_val).days if sent_date_val else 0
+        if sent_age_days > 3:
+            is_sentiment_stale = True
+
         sentiment_data = {
             "sentiment_score": round(float(sentiment_record.sentiment_score), 4),
             "positive_prob": round(float(sentiment_record.positive_prob), 4),
             "negative_prob": round(float(sentiment_record.negative_prob), 4),
             "neutral_prob": round(float(sentiment_record.neutral_prob), 4),
             "headline_count": sentiment_record.headline_count,
+            "method": sent_method,
+            "age_days": sent_age_days,
+            "is_stale": is_sentiment_stale,
             "status": "AVAILABLE"
         }
     else:
@@ -437,20 +507,37 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
             run_batch_sentiment.delay(ticker)
         except Exception as e:
             print(f"[SENTIMENT BROKER WARNING] Celery broker unreachable: {e}")
+        sent_method = "pending"
         sentiment_data = {
             "sentiment_score": 0.0,
             "positive_prob": 0.33,
             "negative_prob": 0.33,
             "neutral_prob": 0.34,
             "headline_count": 0,
+            "method": "pending",
+            "age_days": 0,
+            "is_stale": False,
             "status": "PROCESSING_IN_BACKGROUND"
         }
 
     # 9. Compute Unified Confluence Signal (Combining ML + NLP + Volume)
     if ml_available:
         signal, summary = confluence_decision(
-            is_bullish, sentiment_data["sentiment_score"], bool(is_anomaly), vol_z
+            is_bullish=is_bullish,
+            news_score=sentiment_data["sentiment_score"],
+            is_anomaly=bool(is_anomaly),
+            vol_z=vol_z,
+            confidence_pct=confidence_pct,
+            sentiment_method=sent_method,
+            is_sentiment_stale=is_sentiment_stale
         )
+        # Freshness Check 2: Market Price Freshness
+        price_date = latest_price.date
+        price_date_val = price_date.date() if hasattr(price_date, "date") else price_date
+        price_age_days = (current_date_val - price_date_val).days if price_date_val else 0
+        if price_age_days > 7:
+            summary += f" [Caution: Market price data is {price_age_days} days old]."
+
         ml_layer = {
             "status": "OK",
             "prediction": "BULLISH" if is_bullish else "BEARISH",
@@ -488,47 +575,52 @@ def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
         "cached": False
     }
 
-    # 11. Save in Redis with 5-minute (300s) TTL; never cache an UNAVAILABLE answer
+    # 11. Save in Redis with TTL; short TTL for pending background jobs, standard 300s otherwise
     if not ml_available:
         return response_payload
+
+    ttl = 10 if sentiment_data.get("status") == "PROCESSING_IN_BACKGROUND" else 300
     try:
         redis_payload = response_payload.copy()
         redis_payload["cached"] = True
-        redis_client.setex(cache_key, 300, json.dumps(redis_payload))
-        print(f"[CACHE SAVED] Cached unified intelligence for {ticker} (TTL: 300s).")
+        redis_client.setex(cache_key, ttl, json.dumps(redis_payload))
+        print(f"[CACHE SAVED] Cached unified intelligence for {ticker} (TTL: {ttl}s).")
     except Exception as e:
         print(f"[CACHE WARNING] Failed to cache in Redis: {e}")
 
     return response_payload
 
+
+@app.get("/api/stocks/{ticker}/intelligence")
+def get_unified_stock_intelligence(ticker: str, db: Session = Depends(get_db)):
+    """API Gateway endpoint exposing unified cross-layer intelligence."""
+    return compute_unified_intelligence_data(ticker, db)
+
+
 class TradeRequest(BaseModel):
-    symbol: str = Field(..., example="AAPL")
-    signal: str = Field(..., example="STRONG BUY")
-    qty: Optional[float] = Field(None, gt=0, example=10.0, description="Manual share count. If None or sizing_mode='auto', dynamic risk sizing is used.")
-    sizing_mode: Optional[str] = Field("auto", example="auto", description="Execution mode: 'auto' (AI conviction-weighted risk sizing) or 'manual'.")
-    confidence_pct: Optional[float] = Field(100.0, ge=0.0, le=100.0, example=85.0, description="Model prediction confidence percentage.")
+    symbol: str = Field(..., json_schema_extra={"example": "AAPL"})
+    side: Optional[str] = Field("BUY", json_schema_extra={"example": "BUY"}, description="Order side: 'BUY' or 'SELL'.")
+    qty: Optional[float] = Field(None, gt=0, json_schema_extra={"example": 10.0}, description="Manual share count. If None or sizing_mode='auto', dynamic risk sizing is used.")
+    sizing_mode: Optional[str] = Field("auto", json_schema_extra={"example": "auto"}, description="Execution mode: 'auto' (AI conviction-weighted risk sizing) or 'manual'.")
+    signal: Optional[str] = Field(None, description="DEPRECATED: Signal is verified server-side from live intelligence.")
+    confidence_pct: Optional[float] = Field(None, description="DEPRECATED: Conviction is verified server-side from live model.")
 
     @field_validator("symbol")
     @classmethod
     def validate_symbol(cls, v: str) -> str:
         clean = v.strip().upper()
-        if not clean or len(clean) > 10 or not clean.replace(".", "").replace("/", "").isalnum():
-            raise ValueError(f"Invalid stock ticker symbol: '{v}'. Must be valid alphanumeric ticker.")
+        if clean not in SUPPORTED_TICKERS:
+            raise ValueError(f"Invalid stock ticker '{v}'. Execution strictly restricted to model assets: {', '.join(SUPPORTED_TICKERS)}")
         return clean
 
-    @field_validator("signal")
+    @field_validator("side")
     @classmethod
-    def validate_signal(cls, v: str) -> str:
-        return v.strip().upper()
+    def validate_side(cls, v: Optional[str]) -> str:
+        clean = (v or "BUY").strip().upper()
+        if clean not in ["BUY", "SELL"]:
+            raise ValueError(f"Invalid order side '{v}'. Must be 'BUY' or 'SELL'.")
+        return clean
 
-API_KEY = os.getenv("STREAMQUANT_API_KEY", "streamquant-dev-secret")
-
-def verify_api_key(x_api_key: Optional[str] = Header(None)):
-    if x_api_key != API_KEY:
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized: Missing or invalid X-API-KEY header."
-        )
 
 @app.get("/portfolio-summary", dependencies=[Depends(verify_api_key)])
 def get_portfolio_summary():
@@ -538,6 +630,7 @@ def get_portfolio_summary():
     """
     return alpaca_executor.get_account_portfolio()
 
+
 @app.get("/recent-orders", dependencies=[Depends(verify_api_key)])
 def get_recent_orders():
     """
@@ -545,21 +638,83 @@ def get_recent_orders():
     """
     return alpaca_executor.get_recent_orders()
 
+
 @app.post("/execute-trade", dependencies=[Depends(verify_api_key)])
-def execute_trade(request: TradeRequest):
+def execute_trade(request: TradeRequest, db: Session = Depends(get_db)):
     """
-    Receives trade triggers from the UI, validates them through Pydantic,
-    and routes them through the execution engine's risk firewall and position sizing engine.
+    Executes a paper market order based on server-verified model confluence.
+    Client-provided signals and confidence percentages are discarded; verified values
+    are strictly calculated on the server using live XGBoost and FinBERT data.
     """
+    clean_symbol = request.symbol.upper()
+    order_side = (request.side or "BUY").upper()
+
+    # 1. Server-side confluence verification (eliminates C1 & C2 risk)
+    intel = compute_unified_intelligence_data(clean_symbol, db, use_cache=False)
+    if intel.get("status") != "OK":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Trade rejected: Model intelligence for {clean_symbol} is currently UNAVAILABLE."
+        )
+
+    verified_signal = intel["confluence_decision"]["signal"]
+    verified_conf = float(intel["ml_trend_layer"]["confidence_pct"] or 0.0)
+    sentiment_score = float(intel.get("nlp_sentiment_layer", {}).get("sentiment_score", 0.0))
+    sentiment_method = str(intel.get("nlp_sentiment_layer", {}).get("method", "finbert"))
+
+    # 2. Risk Gate: BUY orders require verified STRONG BUY with >=65% confidence
+    if order_side == "BUY":
+        if verified_signal != "STRONG BUY":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Trade rejected: Verified server signal is '{verified_signal}'. Execution strictly requires STRONG BUY."
+            )
+        if verified_conf < 65.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Trade rejected: Verified confidence ({verified_conf:.1f}%) is below 65% institutional threshold."
+            )
+        if sentiment_method == "lexicon_fallback":
+            raise HTTPException(
+                status_code=400,
+                detail="Trade rejected: Sentiment was derived from unverified keyword fallback; STRONG BUY execution blocked."
+            )
+
+    # 3. Route through execution engine (position-aware, market-hours checked, idempotency keyed)
     result = alpaca_executor.execute_trade_signal(
-        symbol=request.symbol,
-        signal=request.signal,
+        symbol=clean_symbol,
+        signal=verified_signal,
+        side=order_side,
         qty=request.qty,
         sizing_mode=request.sizing_mode or "auto",
-        confidence_pct=request.confidence_pct if request.confidence_pct is not None else 100.0
+        confidence_pct=verified_conf
     )
+
     if not result.get("success", False):
-        raise HTTPException(status_code=400, detail=result.get("error", "Trade execution failed."))
+        status_code = result.get("status_code", 400)
+        raise HTTPException(status_code=status_code, detail=result.get("error", "Trade execution failed."))
+
+    # 4. Institutional Audit Trail Logging to DB
+    try:
+        audit_record = OrderAudit(
+            client_order_id=result.get("client_order_id", ""),
+            broker_order_id=result.get("order_id", ""),
+            ticker=clean_symbol,
+            side=order_side,
+            qty=float(result.get("qty", 0.0)),
+            executed_price=float(result.get("executed_price", 0.0)),
+            signal=verified_signal,
+            confidence_pct=verified_conf,
+            sentiment_score=sentiment_score,
+            sentiment_method=sentiment_method,
+            status=result.get("status", "SUBMITTED")
+        )
+        db.add(audit_record)
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[AUDIT WARNING] Failed to persist order audit record: {e}")
+
     return result
 
 # =====================================================================
@@ -737,6 +892,7 @@ def _overview_row(sym: str, db: Session) -> dict:
     is_anomaly = vol_z > ANOMALY_Z_THRESHOLD
 
     sent_score = 0.0
+    sent_method = "finbert"
     try:
         sent_record = (
             db.query(StockNewsSentiment)
@@ -746,10 +902,18 @@ def _overview_row(sym: str, db: Session) -> dict:
         )
         if sent_record:
             sent_score = float(sent_record.sentiment_score)
+            sent_method = getattr(sent_record, "method", "finbert")
     except Exception:
         db.rollback()
 
-    signal, _ = confluence_decision(is_bullish, sent_score, is_anomaly, vol_z)
+    signal, _ = confluence_decision(
+        is_bullish=is_bullish,
+        news_score=sent_score,
+        is_anomaly=is_anomaly,
+        vol_z=vol_z,
+        confidence_pct=confidence_pct,
+        sentiment_method=sent_method
+    )
 
     return {
         "ticker": sym,
@@ -771,10 +935,11 @@ def _overview_row(sym: str, db: Session) -> dict:
 def get_news_headlines(ticker: Optional[str] = None, limit: int = Query(5, ge=1, le=20)):
     """
     Returns latest news headlines scored with FinBERT sentiment.
+    Non-blocking: reads directly from Redis cache and triggers asynchronous Celery refresh.
     """
-    from ml_models.sentiment import fetch_headlines, analyze_headlines
+    clean_ticker = ticker.upper() if ticker else None
+    cache_key = f"headlines_sentiment_{clean_ticker or 'ALL'}_{limit}"
 
-    cache_key = f"headlines_sentiment_{ticker or 'ALL'}_{limit}"
     try:
         cached = redis_client.get(cache_key)
         if cached:
@@ -782,19 +947,25 @@ def get_news_headlines(ticker: Optional[str] = None, limit: int = Query(5, ge=1,
     except Exception:
         pass
 
-    tickers_to_check = [ticker.upper()] if ticker else ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
-    all_headlines = []
+    # Trigger asynchronous background processing so web request is never blocked
+    try:
+        refresh_news_headlines_task.delay(clean_ticker, limit)
+    except Exception as e:
+        print(f"[HEADLINES] Celery background refresh trigger notice: {e}")
 
+    # Fast non-blocking fallback if cache is cold
+    from ml_models.sentiment import fetch_headlines, _lexicon_analyze
+    tickers_to_check = [clean_ticker] if clean_ticker else SUPPORTED_TICKERS
+    all_headlines = []
     for sym in tickers_to_check:
         try:
-            sample_limit = limit if ticker else max(2, (limit // len(tickers_to_check)) + 1)
+            sample_limit = limit if clean_ticker else max(2, (limit // len(tickers_to_check)) + 1)
             hl = fetch_headlines(sym, limit=sample_limit)
             for h in hl:
                 all_headlines.append({"ticker": sym, "text": h})
         except Exception:
             pass
 
-    # Deduplicate
     unique_items = []
     seen = set()
     for item in all_headlines:
@@ -805,48 +976,28 @@ def get_news_headlines(ticker: Optional[str] = None, limit: int = Query(5, ge=1,
         if len(unique_items) >= limit:
             break
 
-    # Score with FinBERT
-    texts = [item["text"] for item in unique_items]
-    try:
-        sentiments = analyze_headlines(texts)
-    except Exception:
-        sentiments = []
-
     headlines_payload = []
-    for i, item in enumerate(unique_items):
-        if i < len(sentiments):
-            s = sentiments[i]
-            score = round(float(s.score), 3)
-            pos = round(float(s.positive), 3)
-            neg = round(float(s.negative), 3)
-            neu = round(float(s.neutral), 3)
-        else:
-            score, pos, neg, neu = 0.0, 0.33, 0.33, 0.34
-
+    for item in unique_items:
+        s = _lexicon_analyze(item["text"])
+        score = round(float(s.score), 3)
         badge = "POSITIVE" if score > 0.15 else "NEGATIVE" if score < -0.15 else "NEUTRAL"
         color = "green" if score > 0.15 else "red" if score < -0.15 else "gray"
-
         headlines_payload.append({
             "ticker": item["ticker"],
             "headline": item["text"],
             "sentiment_score": score,
             "sentiment_label": badge,
             "badge_color": color,
-            "positive_prob": pos,
-            "negative_prob": neg,
-            "neutral_prob": neu
+            "positive_prob": round(float(s.positive), 3),
+            "negative_prob": round(float(s.negative), 3),
+            "neutral_prob": round(float(s.neutral), 3),
+            "method": "lexicon_fallback"
         })
 
     payload = {
-        "ticker": ticker or "ALL",
+        "ticker": clean_ticker or "ALL",
         "count": len(headlines_payload),
         "headlines": headlines_payload[:limit]
     }
-
-    try:
-        redis_client.setex(cache_key, 180, json.dumps(payload))
-    except Exception:
-        pass
-
     return payload
 

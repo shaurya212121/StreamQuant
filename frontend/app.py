@@ -7,17 +7,20 @@ from pathlib import Path
 import json
 import sys
 import os
+import html
 
-API_KEY = os.getenv("STREAMQUANT_API_KEY", "streamquant-dev-secret")
-API_HEADERS = {"X-API-KEY": API_KEY}
+# Load API key and host configuration
+API_KEY = os.getenv("STREAMQUANT_API_KEY", "")
+API_HEADERS = {"X-API-KEY": API_KEY} if API_KEY else {}
 
-# Ensure project root is in sys.path for direct model/sentiment fallback access
+SERVER_HOST = os.getenv("STREAMQUANT_API_HOST", "http://127.0.0.1:8000")
+API_BASE = f"{SERVER_HOST}/api"
+ALL_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
+
+# Ensure project root is in sys.path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
-
-API_BASE = "http://127.0.0.1:8000/api"
-ALL_TICKERS = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
 
 # ── 1. Page Configuration & Custom CSS ───────────────────────────────
 st.set_page_config(
@@ -204,15 +207,15 @@ st.markdown("""
 
 @st.cache_data(ttl=60)
 def fetch_market_overview():
-    """Fetch all 6 tickers overview grid data from backend or local fallback."""
+    """Fetch all 6 tickers overview grid data from backend."""
     try:
-        resp = requests.get(f"{API_BASE}/market/overview", timeout=4)
+        resp = requests.get(f"{API_BASE}/market/overview", headers=API_HEADERS, timeout=4)
         if resp.status_code == 200:
             return resp.json()
     except Exception:
         pass
 
-    # Local Fallback using yfinance directly so the overview never fails
+    # Never fabricate AI signals or confidence. If backend is unavailable, return real prices only with UNAVAILABLE signal
     import yfinance as yf
     overview = []
     for sym in ALL_TICKERS:
@@ -224,33 +227,28 @@ def fetch_market_overview():
                 prev = float(hist["Close"].iloc[-2])
                 diff = round(latest - prev, 2)
                 pct = round((diff / prev) * 100, 2)
-                vol = hist["Volume"]
-                z = (vol.iloc[-1] - vol.mean()) / (vol.std() + 1e-6)
-                is_anom = abs(z) > 2.0
-                sig = "STRONG BUY" if pct > 0.5 else "CAUTIOUS BUY" if pct > 0 else "STRONG SELL" if pct < -0.5 else "NEUTRAL / HOLD"
-                conf = 84.0 if pct > 0 else 76.5
                 overview.append({
                     "ticker": sym,
                     "latest_price": round(latest, 2),
                     "dollar_change": diff,
                     "pct_change": pct,
-                    "confluence_signal": sig,
-                    "confidence_pct": conf,
-                    "anomaly_alert": f"🚨 Volume Spike ({z:+.2f}σ)" if is_anom else f"Normal ({z:+.2f}σ)",
-                    "is_anomaly": is_anom,
-                    "volume_z_score": round(float(z), 2)
+                    "confluence_signal": "UNAVAILABLE",
+                    "confidence_pct": None,
+                    "anomaly_alert": "Unavailable (Backend Offline)",
+                    "is_anomaly": False,
+                    "volume_z_score": None
                 })
             else:
                 overview.append({
-                    "ticker": sym, "latest_price": 200.0, "dollar_change": 0.0, "pct_change": 0.0,
-                    "confluence_signal": "NEUTRAL / HOLD", "confidence_pct": 70.0,
-                    "anomaly_alert": "Normal (+0.00σ)", "is_anomaly": False, "volume_z_score": 0.0
+                    "ticker": sym, "latest_price": None, "dollar_change": None, "pct_change": None,
+                    "confluence_signal": "UNAVAILABLE", "confidence_pct": None,
+                    "anomaly_alert": "Unavailable (No Data)", "is_anomaly": False, "volume_z_score": None
                 })
         except Exception:
             overview.append({
-                "ticker": sym, "latest_price": 200.0, "dollar_change": 0.0, "pct_change": 0.0,
-                "confluence_signal": "NEUTRAL / HOLD", "confidence_pct": 70.0,
-                "anomaly_alert": "Normal (+0.00σ)", "is_anomaly": False, "volume_z_score": 0.0
+                "ticker": sym, "latest_price": None, "dollar_change": None, "pct_change": None,
+                "confluence_signal": "UNAVAILABLE", "confidence_pct": None,
+                "anomaly_alert": "Unavailable", "is_anomaly": False, "volume_z_score": None
             })
     return overview
 
@@ -426,18 +424,22 @@ if overview_data:
     table_rows_html = ""
     for item in overview_data:
         sym = item["ticker"]
-        price = f"${item['latest_price']:,.2f}"
-        diff = item["dollar_change"]
-        pct = item["pct_change"]
+        latest_price_val = item.get("latest_price")
+        price = f"${latest_price_val:,.2f}" if latest_price_val is not None else "—"
+        diff = item.get("dollar_change")
+        pct = item.get("pct_change")
         
         # 1-Day Change formatting
-        if pct >= 0:
-            change_pill = f'<span class="pill-up">▲ +${diff:,.2f} (+{pct:.2f}%)</span>'
+        if pct is not None and diff is not None:
+            if pct >= 0:
+                change_pill = f'<span class="pill-up">▲ +${diff:,.2f} (+{pct:.2f}%)</span>'
+            else:
+                change_pill = f'<span class="pill-down">▼ -${abs(diff):,.2f} ({pct:.2f}%)</span>'
         else:
-            change_pill = f'<span class="pill-down">▼ -${abs(diff):,.2f} ({pct:.2f}%)</span>'
+            change_pill = '<span style="color: #64748b; font-size: 13px;">—</span>'
             
         # Confluence Signal Badge
-        sig = item["confluence_signal"]
+        sig = str(item.get("confluence_signal") or "UNAVAILABLE")
         if "STRONG BUY" in sig:
             badge_class = "badge-buy-strong"
             sig_icon = "🟢"
@@ -453,21 +455,27 @@ if overview_data:
         elif "VOLATILITY" in sig:
             badge_class = "badge-volatility"
             sig_icon = "⚡"
+        elif "UNAVAILABLE" in sig:
+            badge_class = "badge-neutral"
+            sig_icon = "⚪"
         else:
             badge_class = "badge-neutral"
             sig_icon = "⚖️"
         sig_badge = f'<span class="{badge_class}">{sig_icon} {sig}</span>'
         
         # Confidence %
-        conf = item["confidence_pct"]
-        conf_bar = f"""
-            <div style="display: flex; align-items: center; gap: 8px;">
-                <span style="font-weight: 700; color: #f1f5f9; min-width: 42px;">{conf:.1f}%</span>
-                <div style="background: #1e293b; border-radius: 4px; height: 6px; width: 70px; overflow: hidden;">
-                    <div style="background: linear-gradient(90deg, #3b82f6, #10b981); width: {min(conf, 100)}%; height: 100%;"></div>
+        conf = item.get("confidence_pct")
+        if conf is not None:
+            conf_bar = f"""
+                <div style="display: flex; align-items: center; gap: 8px;">
+                    <span style="font-weight: 700; color: #f1f5f9; min-width: 42px;">{conf:.1f}%</span>
+                    <div style="background: #1e293b; border-radius: 4px; height: 6px; width: 70px; overflow: hidden;">
+                        <div style="background: linear-gradient(90deg, #3b82f6, #10b981); width: {min(max(conf, 0.0), 100.0)}%; height: 100%;"></div>
+                    </div>
                 </div>
-            </div>
-        """
+            """
+        else:
+            conf_bar = '<span style="color: #64748b; font-size: 13px;">—</span>'
         
         # Anomaly Alert
         alert_text = item["anomaly_alert"]
@@ -570,24 +578,20 @@ if not has_gateway_data:
         df_raw = df_raw.rename(columns={date_col: "date", "Open": "open", "High": "high", "Low": "low", "Close": "close", "Volume": "volume"})
         df = df_raw.set_index("date")
         
-        # Technical calculations
+        # Real historical calculations only - never invent AI signals
         df["sma_ratio"] = (df["close"].rolling(10).mean() - df["close"].rolling(50).mean()) / df["close"].rolling(50).mean()
         vol_mean = df["volume"].rolling(20).mean()
         vol_std = df["volume"].rolling(20).std()
         df["volume_z_score"] = (df["volume"] - vol_mean) / (vol_std + 1e-6)
         
-        z_score = float(df["volume_z_score"].iloc[-1])
+        z_score = float(df["volume_z_score"].iloc[-1]) if len(df) > 0 and not pd.isna(df["volume_z_score"].iloc[-1]) else 0.0
         is_anomaly = abs(z_score) > 2.0
-        signal = "BULLISH" if df["close"].iloc[-1] >= df["close"].iloc[-2] else "BEARISH"
-        confidence = 82.5 if signal == "BULLISH" else 76.0
-        confluence_signal = "STRONG BUY" if signal == "BULLISH" else "CAUTIOUS SELL"
-        confluence_summary = f"Real-time technical trend is {signal} with stable institutional liquidity."
-        top_drivers = [
-            {"feature": "sma_ratio", "current_value": round(float(df["sma_ratio"].iloc[-1]), 4), "shap_impact": 0.18 if signal == "BULLISH" else -0.15},
-            {"feature": "volume_z_score", "current_value": round(z_score, 2), "shap_impact": 0.08},
-            {"feature": "daily_return", "current_value": round(float(df["close"].pct_change().iloc[-1]), 4), "shap_impact": 0.12}
-        ]
-        sentiment_layer = {"status": "AVAILABLE", "sentiment_score": 0.45}
+        signal = "UNAVAILABLE"
+        confidence = None
+        confluence_signal = "UNAVAILABLE"
+        confluence_summary = f"API intelligence pipeline offline for {active_sym}. Verified confluence signal unavailable."
+        top_drivers = []
+        sentiment_layer = {"status": "UNAVAILABLE", "sentiment_score": 0.0}
         intel_data = {"ticker": active_sym, "signal": confluence_signal}
     except Exception as exc:
         st.error(f"Could not load data for {active_sym}: {exc}")
@@ -619,20 +623,29 @@ st.markdown("#### 🧠 Tri-Signal Intelligence Matrix")
 sig_col1, sig_col2, sig_col3 = st.columns(3)
 
 with sig_col1:
+    conf_str = f"{confidence:.1f}%" if confidence is not None else "N/A"
     if signal == "BULLISH":
         st.markdown(f"""
             <div style="background: linear-gradient(135deg, #064e3b, #047857); border-radius: 10px; padding: 18px; border-left: 5px solid #10b981;">
                 <p style="color: #6ee7b7; font-size: 11px; margin: 0; font-weight: 700; letter-spacing: 1px;">📈 TECHNICAL DIRECTION</p>
                 <p style="color: #ffffff; font-size: 24px; font-weight: 800; margin: 4px 0;">BULLISH</p>
-                <p style="color: #a7f3d0; font-size: 13px; margin: 0;">XGBoost Confidence: <b>{confidence}%</b></p>
+                <p style="color: #a7f3d0; font-size: 13px; margin: 0;">XGBoost Confidence: <b>{conf_str}</b></p>
             </div>
         """, unsafe_allow_html=True)
-    else:
+    elif signal == "BEARISH":
         st.markdown(f"""
             <div style="background: linear-gradient(135deg, #7f1d1d, #b91c1c); border-radius: 10px; padding: 18px; border-left: 5px solid #ef4444;">
                 <p style="color: #fca5a5; font-size: 11px; margin: 0; font-weight: 700; letter-spacing: 1px;">📉 TECHNICAL DIRECTION</p>
                 <p style="color: #ffffff; font-size: 24px; font-weight: 800; margin: 4px 0;">BEARISH</p>
-                <p style="color: #fecaca; font-size: 13px; margin: 0;">XGBoost Confidence: <b>{confidence}%</b></p>
+                <p style="color: #fecaca; font-size: 13px; margin: 0;">XGBoost Confidence: <b>{conf_str}</b></p>
+            </div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+            <div style="background: linear-gradient(135deg, #1e293b, #334155); border-radius: 10px; padding: 18px; border-left: 5px solid #64748b;">
+                <p style="color: #94a3b8; font-size: 11px; margin: 0; font-weight: 700; letter-spacing: 1px;">⚪ TECHNICAL DIRECTION</p>
+                <p style="color: #ffffff; font-size: 24px; font-weight: 800; margin: 4px 0;">UNAVAILABLE</p>
+                <p style="color: #cbd5e1; font-size: 13px; margin: 0;">XGBoost Confidence: <b>{conf_str}</b></p>
             </div>
         """, unsafe_allow_html=True)
 
@@ -837,7 +850,7 @@ with tab_shap:
 # ── Tab 4: Alpaca Execution Panel ──
 with tab_execution:
     st.markdown(f"### 💼 Alpaca Paper Trading Execution: {active_sym}")
-    st.caption("AI conviction-weighted execution with automated risk sizing and order controls.")
+    st.caption("AI conviction-weighted execution with server-verified risk sizing and institutional controls.")
 
     trade_col1, trade_col2 = st.columns(2)
     with trade_col1:
@@ -846,37 +859,48 @@ with tab_execution:
         if "manual" in sizing_mode:
             shares_qty = st.number_input("Share Count:", min_value=1.0, value=10.0, step=1.0)
 
-        trigger_order = st.button(f"⚡ Execute {confluence_signal} for {active_sym}", type="primary", use_container_width=True)
+        is_executable = (confluence_signal == "STRONG BUY")
+        button_label = f"⚡ Execute BUY for {active_sym}" if is_executable else f"🔒 Execute Order ({confluence_signal})"
+
+        trigger_order = st.button(button_label, type="primary", use_container_width=True, disabled=not is_executable)
         if trigger_order:
             order_payload = {
                 "symbol": active_sym,
-                "signal": confluence_signal,
+                "side": "BUY",
                 "qty": shares_qty if "manual" in sizing_mode else None,
                 "sizing_mode": "manual" if "manual" in sizing_mode else "auto",
-                "confidence_pct": confidence
             }
             try:
-                res = requests.post("http://127.0.0.1:8000/execute-trade", json=order_payload, headers=API_HEADERS, timeout=5)
+                res = requests.post(f"{SERVER_HOST}/execute-trade", json=order_payload, headers=API_HEADERS, timeout=5)
                 if res.status_code == 200:
                     st.success(f"Order executed successfully! Details: {res.json()}")
                 else:
-                    st.warning(f"Trade execution response: {res.text}")
+                    st.error(f"Trade execution rejected: {res.text}")
             except Exception as e:
-                st.info(f"Simulated execution submitted for {active_sym} ({confluence_signal}). Backend executor offline or API key mock mode.")
+                st.error(f"Trade execution failed: Could not connect to backend server ({e}).")
 
     with trade_col2:
         try:
-            port_res = requests.get("http://127.0.0.1:8000/portfolio-summary", headers=API_HEADERS, timeout=2)
+            port_res = requests.get(f"{SERVER_HOST}/portfolio-summary", headers=API_HEADERS, timeout=2)
             if port_res.status_code == 200:
                 pdata = port_res.json()
-                st.metric("Paper Portfolio Equity", f"${pdata.get('equity', 100000):,.2f}")
-                st.metric("Cash Buying Power", f"${pdata.get('buying_power', 200000):,.2f}")
+                equity_val = pdata.get('portfolio_value', pdata.get('equity'))
+                bp_val = pdata.get('buying_power')
+                if equity_val is not None:
+                    st.metric("Paper Portfolio Equity", f"${float(equity_val):,.2f}")
+                else:
+                    st.metric("Paper Portfolio Equity", "Unavailable")
+
+                if bp_val is not None:
+                    st.metric("Cash Buying Power", f"${float(bp_val):,.2f}")
+                else:
+                    st.metric("Cash Buying Power", "Unavailable")
             else:
-                st.metric("Paper Portfolio Equity", "$100,000.00 (Mock)")
-                st.metric("Cash Buying Power", "$200,000.00 (Mock)")
+                st.metric("Paper Portfolio Equity", "Unavailable (Broker Error)")
+                st.metric("Cash Buying Power", "Unavailable (Broker Error)")
         except Exception:
-            st.metric("Paper Portfolio Equity", "$100,000.00 (Offline)")
-            st.metric("Cash Buying Power", "$200,000.00 (Offline)")
+            st.metric("Paper Portfolio Equity", "Unavailable (Offline)")
+            st.metric("Cash Buying Power", "Unavailable (Offline)")
 
 
 # =====================================================================
@@ -893,6 +917,7 @@ if bottom_headlines:
     for idx, item in enumerate(bottom_headlines):
         sc = item.get("sentiment_score", 0.0)
         sym_tag = item.get("ticker", active_sym)
+        escaped_headline = html.escape(item.get("headline", ""))
         
         if sc > 0.15:
             b_color = "#10b981"
@@ -916,7 +941,7 @@ if bottom_headlines:
                             <span style="font-size: 10px; font-weight: 700; color: {b_color}; background: {b_bg}; padding: 2px 6px; border-radius: 4px;">{b_label}</span>
                         </div>
                         <div style="font-size: 12px; color: #f1f5f9; line-height: 1.35; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical;">
-                            {item.get('headline', '')}
+                            {escaped_headline}
                         </div>
                     </div>
                     <div style="font-size: 10px; color: #64748b; margin-top: 8px; border-top: 1px solid #1e293b; padding-top: 6px;">
@@ -924,3 +949,10 @@ if bottom_headlines:
                     </div>
                 </div>
             """, unsafe_allow_html=True)
+
+st.markdown("""
+<div style="text-align: center; color: #64748b; font-size: 11px; margin-top: 30px; padding: 12px; border-top: 1px solid #1e293b;">
+    ⚠️ <b>StreamQuant Regulatory & Risk Notice:</b> This platform is designed solely for quantitative research, backtesting, and paper simulated trading. 
+    Machine learning forecasts and sentiment classifications carry inherent probabilistic uncertainty. Past performance and backtested equity curves do not guarantee future returns.
+</div>
+""", unsafe_allow_html=True)

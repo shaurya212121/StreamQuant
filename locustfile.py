@@ -30,8 +30,7 @@ class StreamQuantUser(HttpUser):
             if response.status_code == 200:
                 response.success()
             elif response.status_code == 429:
-                # 429 confirms our Redis sliding-window defense is working!
-                response.success()
+                response.failure("Rate limited: HTTP 429 (Too Many Requests)")
             else:
                 response.failure(f"HTTP {response.status_code}")
 
@@ -46,7 +45,9 @@ class StreamQuantUser(HttpUser):
             name="/api/stocks/[ticker]?limit=30",
             catch_response=True
         ) as response:
-            if response.status_code in [200, 429]:
+            if response.status_code == 200:
                 response.success()
+            elif response.status_code == 429:
+                response.failure("Rate limited: HTTP 429 (Too Many Requests)")
             else:
                 response.failure(f"HTTP {response.status_code}")

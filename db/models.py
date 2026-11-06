@@ -64,6 +64,9 @@ class StockNewsSentiment(Base):
 
     headline_count = Column(Integer, nullable=False, default=0)
 
+    # Provenance tracking: 'finbert' vs 'lexicon_fallback'
+    method = Column(String(30), nullable=False, server_default="finbert", default="finbert")
+
     updated_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -76,6 +79,29 @@ class StockNewsSentiment(Base):
     )
 
 
+class OrderAudit(Base):
+    """Compliance & Risk Audit Trail: links every executed order with its source model signal and features."""
+    __tablename__ = "order_audit_trail"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    client_order_id = Column(String(64), unique=True, nullable=False, index=True)
+    broker_order_id = Column(String(64), nullable=True, index=True)
+    ticker = Column(String(10), nullable=False, index=True)
+    side = Column(String(10), nullable=False)
+    qty = Column(Float, nullable=False)
+    executed_price = Column(Float, nullable=True)
+    signal = Column(String(30), nullable=False)
+    confidence_pct = Column(Float, nullable=True)
+    sentiment_score = Column(Float, nullable=True)
+    sentiment_method = Column(String(30), nullable=True)
+    status = Column(String(30), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
 def upsert_news_sentiment(
     ticker: str,
     sentiment_date: date_type,
@@ -84,15 +110,14 @@ def upsert_news_sentiment(
     negative_prob: float,
     neutral_prob: float,
     headline_count: int,
+    method: str = "finbert",
     session: Optional[Session] = None,
 ) -> None:
     """Insert or update the news sentiment row for (ticker, sentiment_date).
 
     Uses PostgreSQL ``INSERT ... ON CONFLICT (ticker, date) DO UPDATE`` so
     re-running for the same ticker and day overwrites the row instead of
-    duplicating it. If ``session`` is omitted, a short-lived session is
-    opened from ``db.database.SessionLocal`` and committed/closed here.
-    A caller-supplied session is committed but left open for the caller.
+    duplicating it.
     """
     values = {
         "ticker": ticker.upper(),
@@ -102,6 +127,7 @@ def upsert_news_sentiment(
         "negative_prob": float(negative_prob),
         "neutral_prob": float(neutral_prob),
         "headline_count": int(headline_count),
+        "method": str(method),
     }
 
     stmt = pg_insert(StockNewsSentiment).values(**values)
@@ -113,6 +139,7 @@ def upsert_news_sentiment(
             "negative_prob": stmt.excluded.negative_prob,
             "neutral_prob": stmt.excluded.neutral_prob,
             "headline_count": stmt.excluded.headline_count,
+            "method": stmt.excluded.method,
             "updated_at": func.now(),
         },
     )

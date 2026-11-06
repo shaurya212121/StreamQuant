@@ -94,6 +94,15 @@ def fetch_headlines(symbol: str, limit: int = MAX_HEADLINES) -> List[str]:
             unique.append(h)
     return unique[:limit]
 
+def download_finbert_weights():
+    """Utility to pre-download FinBERT weights during worker/Docker build."""
+    from transformers import AutoModelForSequenceClassification, AutoTokenizer
+    logger.info("Pre-downloading %s weights...", FINBERT_MODEL_NAME)
+    AutoTokenizer.from_pretrained(FINBERT_MODEL_NAME, local_files_only=False)
+    AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL_NAME, local_files_only=False)
+    logger.info("Successfully downloaded %s weights.", FINBERT_MODEL_NAME)
+
+
 def _load_finbert():
     """Lazy, thread-safe singleton so the model loads once per process."""
     global _model_bundle
@@ -106,8 +115,13 @@ def _load_finbert():
             try:
                 tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL_NAME, local_files_only=True)
                 model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL_NAME, local_files_only=True)
-            except Exception as e:
-                raise RuntimeError(f"FinBERT weights not fully cached locally ({e}); using fast calibrated fallback.")
+            except Exception:
+                try:
+                    logger.info("Weights not found in local cache; downloading %s...", FINBERT_MODEL_NAME)
+                    tokenizer = AutoTokenizer.from_pretrained(FINBERT_MODEL_NAME, local_files_only=False)
+                    model = AutoModelForSequenceClassification.from_pretrained(FINBERT_MODEL_NAME, local_files_only=False)
+                except Exception as e:
+                    raise RuntimeError(f"FinBERT weights not available ({e}); using fast calibrated fallback.")
 
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             model.to(device)
@@ -143,6 +157,7 @@ class SentimentResult:
     negative: float = 0.0
     neutral: float = 0.0
     headline_count: int = 0
+    method: str = "finbert"
     details: List[HeadlineSentiment] = field(default_factory=list)
 
 
@@ -198,10 +213,10 @@ def _lexicon_analyze(text: str) -> HeadlineSentiment:
     )
 
 
-def analyze_headlines(headlines: List[str]) -> List[HeadlineSentiment]:
-    """Run FinBERT over each headline and return per-headline probabilities, with resilient fallback."""
+def analyze_headlines_with_method(headlines: List[str]) -> tuple[List[HeadlineSentiment], str]:
+    """Run FinBERT over each headline and return per-headline probabilities alongside provenance method."""
     if not headlines:
-        return []
+        return [], "finbert"
 
     try:
         import torch
@@ -231,18 +246,23 @@ def analyze_headlines(headlines: List[str]) -> List[HeadlineSentiment]:
                         neutral=p[idx["neutral"]],
                     )
                 )
-        return results
+        return results, "finbert"
     except Exception as exc:
         logger.warning("FinBERT inference unavailable (%s); using calibrated financial lexicon fallback.", exc)
-        return [_lexicon_analyze(h) for h in headlines]
+        return [_lexicon_analyze(h) for h in headlines], "lexicon_fallback"
 
+
+def analyze_headlines(headlines: List[str]) -> List[HeadlineSentiment]:
+    """Run sentiment analysis over each headline (backward-compatible signature)."""
+    details, _ = analyze_headlines_with_method(headlines)
+    return details
 
 
 def score_headlines(symbol: str, headlines: List[str]) -> SentimentResult:
-    """Aggregate per-headline FinBERT output into one composite score for the symbol."""
-    details = analyze_headlines(headlines)
+    """Aggregate per-headline output into one composite score with method provenance."""
+    details, method = analyze_headlines_with_method(headlines)
     if not details:
-        return SentimentResult(symbol=symbol.upper())
+        return SentimentResult(symbol=symbol.upper(), method=method)
 
     n = len(details)
     return SentimentResult(
@@ -252,6 +272,7 @@ def score_headlines(symbol: str, headlines: List[str]) -> SentimentResult:
         negative=sum(d.negative for d in details) / n,
         neutral=sum(d.neutral for d in details) / n,
         headline_count=n,
+        method=method,
         details=details,
     )
 
@@ -260,7 +281,7 @@ def analyze_and_store(
 ) -> Optional[SentimentResult]:
     """
     Entry point for Celery Worker to fetch news, run heavy inference, 
-    and store the computed result safely into the database.
+    and store the computed result safely into the database with provenance.
     """
     symbol = symbol.upper().strip()
     run_date = run_date or date_type.today()
@@ -279,9 +300,10 @@ def analyze_and_store(
         negative_prob=result.negative,
         neutral_prob=result.neutral,
         headline_count=result.headline_count,
+        method=result.method,
     )
     logger.info(
-        "%s %s: score=%+.3f from %d headlines", symbol, run_date, result.score, result.headline_count
+        "%s %s: score=%+.3f from %d headlines [method=%s]", symbol, run_date, result.score, result.headline_count, result.method
     )
     return result
 

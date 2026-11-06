@@ -1,5 +1,6 @@
 from celery import Celery
 from celery.schedules import crontab
+from typing import Optional
 import random
 import sys
 import time
@@ -52,14 +53,6 @@ celery_app.conf.update(
         }
     },
 )
-
-@celery_app.task
-def run_heavy_ml_model(ticker: str):
-    print(f"\n[WORKER] 🚀 Starting heavy ML Pipeline for {ticker}...")
-    time.sleep(10)
-    print(f"[WORKER] ✅ Finished ML Pipeline for {ticker}!")
-    return {"ticker": ticker, "status": "ML_COMPLETE"}
-
 
 # Ingestion retry policy: 60s, 120s, 240s, 480s, 960s (plus jitter) ≈ 31 min worst case,
 # long enough to ride out a Yahoo Finance rate-limit window.
@@ -141,3 +134,85 @@ def run_all_symbols_sentiment():
     active_symbols = ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
     for sym in active_symbols:
         run_batch_sentiment.delay(sym)
+
+@celery_app.task
+def refresh_news_headlines_task(ticker: Optional[str] = None, limit: int = 5):
+    """
+    Asynchronously fetches live headlines and scores FinBERT sentiment in Celery,
+    caching the final result in Redis so the FastAPI web thread remains completely non-blocking.
+    """
+    ml_dir = str(Path(__file__).resolve().parent.parent / "ml_models")
+    if ml_dir not in sys.path:
+        sys.path.insert(0, ml_dir)
+    from ml_models.sentiment import fetch_headlines, analyze_headlines_with_method
+    import redis
+    import json
+
+    active_symbols = [ticker.upper()] if ticker else ["AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA"]
+    all_headlines = []
+
+    for sym in active_symbols:
+        try:
+            sample_limit = limit if ticker else max(2, (limit // len(active_symbols)) + 1)
+            hl = fetch_headlines(sym, limit=sample_limit)
+            for h in hl:
+                all_headlines.append({"ticker": sym, "text": h})
+        except Exception:
+            pass
+
+    unique_items = []
+    seen = set()
+    for item in all_headlines:
+        clean_text = item["text"].strip()
+        if clean_text not in seen:
+            seen.add(clean_text)
+            unique_items.append(item)
+        if len(unique_items) >= limit:
+            break
+
+    texts = [item["text"] for item in unique_items]
+    try:
+        sentiments, method = analyze_headlines_with_method(texts)
+    except Exception:
+        sentiments, method = [], "lexicon_fallback"
+
+    headlines_payload = []
+    for i, item in enumerate(unique_items):
+        if i < len(sentiments):
+            s = sentiments[i]
+            score = round(float(s.score), 3)
+            pos = round(float(s.positive), 3)
+            neg = round(float(s.negative), 3)
+            neu = round(float(s.neutral), 3)
+        else:
+            score, pos, neg, neu = 0.0, 0.0, 0.0, 1.0
+
+        badge = "POSITIVE" if score > 0.15 else "NEGATIVE" if score < -0.15 else "NEUTRAL"
+        color = "green" if score > 0.15 else "red" if score < -0.15 else "gray"
+
+        headlines_payload.append({
+            "ticker": item["ticker"],
+            "headline": item["text"],
+            "sentiment_score": score,
+            "sentiment_label": badge,
+            "badge_color": color,
+            "positive_prob": pos,
+            "negative_prob": neg,
+            "neutral_prob": neu,
+            "method": method
+        })
+
+    payload = {
+        "ticker": ticker or "ALL",
+        "count": len(headlines_payload),
+        "headlines": headlines_payload[:limit]
+    }
+
+    cache_key = f"headlines_sentiment_{ticker or 'ALL'}_{limit}"
+    try:
+        r = redis.from_url(REDIS_URL, socket_timeout=1.0)
+        r.setex(cache_key, 600, json.dumps(payload))
+    except Exception as e:
+        print(f"[WORKER] Failed to cache headlines in Redis: {e}")
+
+    return payload
